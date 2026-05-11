@@ -28,6 +28,7 @@ final class MatrixSession: ObservableObject {
     @Published private(set) var verificationState: VerificationState = .unknown
     @Published private(set) var sweepActive: Bool = false
     @Published private(set) var sweepProgress: (current: Int, total: Int) = (0, 0)
+    @Published private(set) var verification: VerificationController?
 
     var currentUserId: String? { session?.userId }
     var isAuthenticated: Bool { session != nil }
@@ -160,6 +161,12 @@ final class MatrixSession: ObservableObject {
 
         await syncService.start()
 
+        // SAS verification controller. Other devices can initiate verification of this
+        // device, and we can initiate verification of ourselves from another device.
+        if let ctrl = try? await client.getSessionVerificationController() {
+            self.verification = VerificationController(controller: ctrl)
+        }
+
         // Kick off background pagination so every joined room ends up with full history
         // in the SDK's SQLite cache.
         startBackgroundSweep()
@@ -240,6 +247,7 @@ final class MatrixSession: ObservableObject {
         entriesStreamHandle = nil
         entriesResult = nil
         listenerBox = nil
+        verification = nil
         sweptRoomIds = []
         sweepActive = false
         sweepProgress = (0, 0)

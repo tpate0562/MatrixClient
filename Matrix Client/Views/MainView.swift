@@ -9,6 +9,7 @@ struct MainView: View {
     @State private var showJoinRoom = false
     @State private var joinAlias: String = ""
     @State private var showRecovery = false
+    @State private var showVerify = false
 
     var body: some View {
         NavigationSplitView {
@@ -28,6 +29,7 @@ struct MainView: View {
                             Divider()
                             Button("Join Room by ID/Alias…") { showJoinRoom = true }
                             Divider()
+                            Button("Verify This Device…") { showVerify = true }
                             if session.recoveryState != .enabled {
                                 Button("Recover Encryption Keys…") { showRecovery = true }
                             }
@@ -73,6 +75,21 @@ struct MainView: View {
         }
         .sheet(isPresented: $showRecovery) {
             RecoverySheet()
+        }
+        .sheet(isPresented: Binding(
+            get: { showVerify || session.verification?.presented == true },
+            set: { newValue in
+                if !newValue {
+                    showVerify = false
+                    session.verification?.presented = false
+                }
+            }
+        )) {
+            if let vc = session.verification {
+                VerificationSheet(controller: vc)
+            } else {
+                Text("Verification not ready").padding()
+            }
         }
     }
 
