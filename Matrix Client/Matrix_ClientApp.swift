@@ -1,21 +1,18 @@
-//
-//  Matrix_ClientApp.swift
-//  Matrix Client
-//
-//  Created by Tejas Patel on 5/10/26.
-//
-
 import SwiftUI
-import CoreData
 
 @main
 struct Matrix_ClientApp: App {
-    let persistenceController = PersistenceController.shared
+    @StateObject private var session = MatrixSession()
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environment(\.managedObjectContext, persistenceController.container.viewContext)
+            RootView()
+                .environmentObject(session)
+        }
+        .windowResizability(.contentMinSize)
+
+        Settings {
+            Text("Matrix Client").padding()
         }
     }
 }
