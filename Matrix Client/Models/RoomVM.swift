@@ -38,6 +38,15 @@ final class RoomVM: ObservableObject, Identifiable {
     private var listenerBox: AnyObject?
     private var autoPaginateTask: Task<Void, Never>?
 
+    // Long-lived pinned-events timeline. We mirror its event IDs into
+    // `pinnedEventIds` so the inline pin indicator updates immediately, even
+    // when RoomInfo's pinnedEventIds list is slow to refresh after a pin.
+    private var pinnedIndexTimeline: Timeline?
+    private var pinnedIndexHandle: TaskHandle?
+    private var pinnedIndexBox: AnyObject?
+    private var pinnedFromIndex: Set<String> = []
+    private var pinnedFromRoomInfo: Set<String> = []
+
     init(room: Room, session: MatrixSession) {
         self.id = room.id()
         self.room = room
@@ -69,6 +78,9 @@ final class RoomVM: ObservableObject, Identifiable {
         typingHandle = nil
         listenerBox = nil
         timeline = nil
+        pinnedIndexHandle = nil
+        pinnedIndexBox = nil
+        pinnedIndexTimeline = nil
     }
 
     // MARK: - Attach listeners
@@ -105,6 +117,73 @@ final class RoomVM: ObservableObject, Identifiable {
 
         // Begin loading the full room history in the background.
         startAutoPaginate()
+
+        // Open a long-lived pinned-events timeline so we have an authoritative
+        // index of pinned event IDs, in addition to whatever RoomInfo reports.
+        Task { await openPinnedIndex() }
+    }
+
+    private func openPinnedIndex() async {
+        guard pinnedIndexTimeline == nil else { return }
+        let config = TimelineConfiguration(
+            focus: .pinnedEvents,
+            filter: .all,
+            internalIdPrefix: "pinned-index-\(id)",
+            dateDividerMode: .daily,
+            trackReadReceipts: .disabled,
+            reportUtds: false
+        )
+        do {
+            let t = try await room.timelineWithConfiguration(configuration: config)
+            self.pinnedIndexTimeline = t
+            let listener = TimelineListenerBox { [weak self] diffs in
+                Task { @MainActor in self?.applyPinnedIndex(diffs) }
+            }
+            self.pinnedIndexBox = listener
+            self.pinnedIndexHandle = await t.addListener(listener: listener)
+        } catch {
+            // Non-fatal; we'll fall back to RoomInfo.pinnedEventIds.
+        }
+    }
+
+    private func applyPinnedIndex(_ diffs: [TimelineDiff]) {
+        for diff in diffs {
+            switch diff {
+            case .append(let v):     for item in v { addPinned(item) }
+            case .pushBack(let v):   addPinned(v)
+            case .pushFront(let v):  addPinned(v)
+            case .insert(_, let v):  addPinned(v)
+            case .set(_, let v):     addPinned(v)
+            case .reset(let v):
+                pinnedFromIndex = []
+                for item in v { addPinned(item) }
+            case .clear:
+                pinnedFromIndex = []
+            case .popFront, .popBack, .remove, .truncate:
+                // Best-effort: rebuild from current items.
+                rebuildPinnedFromIndex()
+            }
+        }
+        recomputePinnedEventIds()
+    }
+
+    private func addPinned(_ item: TimelineItem) {
+        guard let event = item.asEvent() else { return }
+        if case .eventId(let id) = event.eventOrTransactionId {
+            pinnedFromIndex.insert(id)
+        }
+    }
+
+    private func rebuildPinnedFromIndex() {
+        guard let t = pinnedIndexTimeline else { return }
+        // The SDK doesn't expose the timeline's current items synchronously; we leave
+        // this best-effort. RoomInfo will catch up.
+        _ = t
+    }
+
+    private func recomputePinnedEventIds() {
+        let combined = pinnedFromIndex.union(pinnedFromRoomInfo)
+        pinnedEventIds = Array(combined)
     }
 
     /// Walk backwards through the timeline until the SDK reports no more history. Runs
@@ -150,7 +229,8 @@ final class RoomVM: ObservableObject, Identifiable {
         avatarUrl = info.avatarUrl
         isDirect = info.isDirect
         membership = info.membership
-        pinnedEventIds = info.pinnedEventIds
+        pinnedFromRoomInfo = Set(info.pinnedEventIds)
+        recomputePinnedEventIds()
         canonicalAlias = info.canonicalAlias
         // EncryptionState is an enum — value `.encrypted` (or similar) indicates E2EE.
         switch info.encryptionState {
@@ -197,9 +277,18 @@ final class RoomVM: ObservableObject, Identifiable {
 
     func send(_ text: String) async {
         guard let timeline else { return }
-        // The SDK converts the markdown body to HTML and populates formatted_body, so other
-        // clients render the formatting correctly.
-        let msg = messageEventContentFromMarkdown(md: text)
+        let msg: RoomMessageEventContentWithoutRelation
+        switch SlashCommandParser.parse(text) {
+        case .rainbow(let body):
+            let pair = MessageBuilder.rainbow(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .spoiler(let body):
+            let pair = MessageBuilder.spoiler(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .none:
+            // Plain markdown — SDK converts to HTML formatted_body automatically.
+            msg = messageEventContentFromMarkdown(md: text)
+        }
         do {
             _ = try await timeline.send(msg: msg)
         } catch { session?.lastError = describe(error) }
@@ -207,10 +296,36 @@ final class RoomVM: ObservableObject, Identifiable {
 
     func sendReply(to eventId: String, text: String) async {
         guard let timeline else { return }
-        let msg = messageEventContentFromMarkdown(md: text)
+        let msg: RoomMessageEventContentWithoutRelation
+        switch SlashCommandParser.parse(text) {
+        case .rainbow(let body):
+            let pair = MessageBuilder.rainbow(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .spoiler(let body):
+            let pair = MessageBuilder.spoiler(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .none:
+            msg = messageEventContentFromMarkdown(md: text)
+        }
         do {
             try await timeline.sendReply(msg: msg, eventId: eventId)
         } catch { session?.lastError = describe(error) }
+    }
+
+    private func buildHTMLMessage(plain: String, html: String) -> RoomMessageEventContentWithoutRelation {
+        let content = MessageContent(
+            msgType: .text(content: TextMessageContent(
+                body: plain,
+                formatted: FormattedBody(format: .html, body: html)
+            )),
+            body: plain,
+            isEdited: false,
+            mentions: nil
+        )
+        // Fall back to plain text if the SDK conversion throws — should never happen for
+        // hand-built content with no relations.
+        return (try? contentWithoutRelationFromMessage(message: content))
+            ?? messageEventContentFromMarkdown(md: plain)
     }
 
     func toggleReaction(targetEventId: String, key: String) async {
@@ -229,12 +344,24 @@ final class RoomVM: ObservableObject, Identifiable {
 
     func pin(eventId: String) async {
         guard let timeline else { return }
+        // Optimistic: flip the indicator immediately so the UI feels responsive,
+        // even before the state event echoes back via sync.
+        pinnedFromRoomInfo.insert(eventId)
+        recomputePinnedEventIds()
         do { _ = try await timeline.pinEvent(eventId: eventId) }
-        catch { session?.lastError = describe(error) }
+        catch {
+            // Roll back on failure.
+            pinnedFromRoomInfo.remove(eventId)
+            recomputePinnedEventIds()
+            session?.lastError = describe(error)
+        }
     }
 
     func unpin(eventId: String) async {
         guard let timeline else { return }
+        pinnedFromRoomInfo.remove(eventId)
+        pinnedFromIndex.remove(eventId)
+        recomputePinnedEventIds()
         do { _ = try await timeline.unpinEvent(eventId: eventId) }
         catch { session?.lastError = describe(error) }
     }

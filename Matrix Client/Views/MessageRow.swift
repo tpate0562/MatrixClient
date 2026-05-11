@@ -90,6 +90,7 @@ private struct EventRow: View {
     @EnvironmentObject private var session: MatrixSession
     @EnvironmentObject private var nicknames: NicknameStore
     @State private var hovering = false
+    @State private var spoilersRevealed = false
 
     private var eventId: String? {
         if case .eventId(let id) = event.eventOrTransactionId { return id }
@@ -264,26 +265,23 @@ private struct EventRow: View {
         let bubbleAlignment: Alignment = (alignment == .trailing) ? .trailing : .leading
         switch msg.msgType {
         case .text(let t):
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(MarkdownRenderer.render(body: t.body, formatted: t.formatted))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .tint(.blue)
-                if msg.isEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
-            }
-            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
+            renderableTextBody(
+                attributed: MarkdownRenderer.render(body: t.body, formatted: t.formatted, revealSpoilers: spoilersRevealed),
+                hasSpoilers: MarkdownRenderer.hasSpoilers(t.formatted),
+                edited: msg.isEdited,
+                alignment: bubbleAlignment
+            )
         case .notice(let n):
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(MarkdownRenderer.render(body: n.body, formatted: n.formatted))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .tint(.blue)
-                if msg.isEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
-            }
-            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
+            renderableTextBody(
+                attributed: MarkdownRenderer.render(body: n.body, formatted: n.formatted, revealSpoilers: spoilersRevealed),
+                hasSpoilers: MarkdownRenderer.hasSpoilers(n.formatted),
+                edited: msg.isEdited,
+                alignment: bubbleAlignment,
+                secondary: true
+            )
         case .emote(let e):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                (Text("* \(senderName) ").italic() + Text(MarkdownRenderer.render(body: e.body, formatted: e.formatted)).italic())
+                (Text("* \(senderName) ").italic() + Text(MarkdownRenderer.render(body: e.body, formatted: e.formatted, revealSpoilers: spoilersRevealed)).italic())
             }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .image(let img):
@@ -343,6 +341,39 @@ private struct EventRow: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+    }
+
+    /// Text body with optional spoiler tap-to-reveal. We always render via Text + AttributedString
+    /// so inline HTML formatting (colors, bold, italic, links) survives — the only piece we
+    /// don't fold into AttributedString is the tap target itself.
+    @ViewBuilder
+    private func renderableTextBody(attributed: AttributedString, hasSpoilers: Bool, edited: Bool, alignment: Alignment, secondary: Bool = false) -> some View {
+        let textView = Text(attributed)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .tint(.blue)
+        let styled: AnyView = secondary
+            ? AnyView(textView.foregroundStyle(.secondary))
+            : AnyView(textView)
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            if hasSpoilers {
+                styled
+                    .contentShape(Rectangle())
+                    .onTapGesture { spoilersRevealed.toggle() }
+                    .help(spoilersRevealed ? "Hide spoilers" : "Tap to reveal spoilers")
+            } else {
+                styled
+            }
+            if edited {
+                Text("(edited)").font(.caption2).foregroundStyle(.secondary)
+            }
+            if hasSpoilers && !spoilersRevealed {
+                Image(systemName: "eye.slash")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: alignment)
     }
 
     @ViewBuilder

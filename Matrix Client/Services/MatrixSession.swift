@@ -361,15 +361,25 @@ final class MatrixSession: ObservableObject {
 
     /// Use the user's recovery key (or passphrase derived recovery key) to restore identity
     /// + key backup, then the SDK will decrypt past messages as keys arrive. After recover
-    /// we wait for E2EE init tasks (cross-signing self-sign etc.) so verification flips to
-    /// `verified` for this device.
+    /// we wait for E2EE init tasks (cross-signing self-sign etc.) and re-check verification
+    /// state for a few seconds — self-signing happens after the next sync so the state
+    /// flips asynchronously.
     func recover(withKey key: String) async {
         guard let enc = client?.encryption() else { return }
         do {
             try await enc.recover(recoveryKey: key)
             await enc.waitForE2eeInitializationTasks()
-            self.verificationState = enc.verificationState()
-            self.recoveryState = enc.recoveryState()
+            // Make sure the backup is enabled so we keep uploading keys for new sessions.
+            try? await enc.enableBackups()
+            // Poll verification state for up to ~10 seconds; the SDK self-signs this
+            // device once it has the master secret + completes a sync.
+            for _ in 0..<10 {
+                let v = enc.verificationState()
+                self.verificationState = v
+                self.recoveryState = enc.recoveryState()
+                if v == .verified { break }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
         }
         catch { lastError = describe(error) }
     }
