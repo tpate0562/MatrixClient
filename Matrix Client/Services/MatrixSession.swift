@@ -46,6 +46,30 @@ final class MatrixSession: ObservableObject {
         }
     }
 
+    /// Sign in using a pre-issued access token (e.g. copied from Element → Settings → Help & About).
+    /// Validates the token via `/account/whoami`, then persists and starts sync.
+    func loginWithToken(homeserverInput: String, accessToken: String) async {
+        lastError = nil
+        do {
+            let resolved = try await api.discoverHomeserver(from: homeserverInput)
+            await api.setHomeserver(resolved)
+            await api.setToken(accessToken)
+            let who = try await api.whoami()
+            let creds = Credentials(
+                homeserverURL: resolved,
+                userId: who.user_id,
+                deviceId: who.device_id ?? "unknown",
+                accessToken: accessToken
+            )
+            self.credentials = creds
+            KeychainStore.save(creds)
+            await startSync()
+        } catch {
+            await api.setToken(nil)
+            self.lastError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+        }
+    }
+
     func logout() async {
         syncTask?.cancel()
         syncTask = nil

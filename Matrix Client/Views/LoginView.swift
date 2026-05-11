@@ -6,6 +6,7 @@ struct LoginView: View {
     @State private var username: String = ""
     @State private var password: String = ""
     @State private var loggingIn = false
+    @State private var showTokenSheet = false
     @FocusState private var focused: Field?
 
     enum Field { case homeserver, user, password }
@@ -52,6 +53,11 @@ struct LoginView: View {
             .controlSize(.large)
             .disabled(loggingIn || username.isEmpty || password.isEmpty)
 
+            Button("Sign in with Access Token") { showTokenSheet = true }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.blue)
+
             Text("Encryption is detected but not yet decoded — encrypted messages show as 🔒 placeholders.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
@@ -62,6 +68,9 @@ struct LoginView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
         .onAppear { focused = .user }
+        .sheet(isPresented: $showTokenSheet) {
+            TokenLoginSheet(homeserver: homeserver)
+        }
     }
 
     private func signIn() {
@@ -98,5 +107,62 @@ private struct LabeledSecure: View {
             SecureField("", text: $text)
                 .textFieldStyle(.roundedBorder)
         }
+    }
+}
+
+private struct TokenLoginSheet: View {
+    @EnvironmentObject private var session: MatrixSession
+    @Environment(\.dismiss) private var dismiss
+
+    @State var homeserver: String
+    @State private var token: String = ""
+    @State private var working = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Sign in with Access Token").font(.title2.bold())
+            Text("Paste an existing access token (e.g. from Element → Settings → Help & About).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Homeserver").font(.caption).foregroundStyle(.secondary)
+                TextField("matrix.org", text: $homeserver)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Access Token").font(.caption).foregroundStyle(.secondary)
+                SecureField("syt_…", text: $token)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            if let err = session.lastError {
+                Text(err).font(.caption).foregroundStyle(.red)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button {
+                    working = true
+                    Task {
+                        await session.loginWithToken(homeserverInput: homeserver, accessToken: token)
+                        working = false
+                        if session.isAuthenticated { dismiss() }
+                    }
+                } label: {
+                    HStack {
+                        if working { ProgressView().controlSize(.small) }
+                        Text("Sign In")
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(working || token.isEmpty || homeserver.isEmpty)
+            }
+        }
+        .padding()
+        .frame(width: 460)
     }
 }
