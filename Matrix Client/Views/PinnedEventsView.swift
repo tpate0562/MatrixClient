@@ -1,21 +1,39 @@
 import SwiftUI
+import MatrixRustSDK
 
-/// Renders the pinned event ids from RoomInfo. Tapping unpin removes via Timeline.unpinEvent.
 struct PinnedEventsView: View {
     @ObservedObject var room: RoomVM
+    @EnvironmentObject private var session: MatrixSession
+    @EnvironmentObject private var nicknames: NicknameStore
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var vm: PinnedEventsVM
+
+    init(room: RoomVM) {
+        self.room = room
+        _vm = StateObject(wrappedValue: PinnedEventsVM(room: room.room))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("Pinned Messages").font(.headline)
+                if vm.loading { ProgressView().controlSize(.small) }
                 Spacer()
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
             .padding()
             Divider()
-            if room.pinnedEventIds.isEmpty {
+
+            if let error = vm.error {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle").font(.title2).foregroundStyle(.orange)
+                    Text("Couldn't load pinned messages").foregroundStyle(.secondary)
+                    Text(error).font(.caption).foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding()
+            } else if vm.items.isEmpty && !vm.loading {
                 VStack(spacing: 8) {
                     Image(systemName: "pin.slash").font(.largeTitle).foregroundStyle(.tertiary)
                     Text("No pinned messages").foregroundStyle(.secondary)
@@ -24,54 +42,116 @@ struct PinnedEventsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding()
             } else {
-                List {
-                    ForEach(room.pinnedEventIds, id: \.self) { id in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(id).font(.caption.monospaced())
-                                if let preview = preview(for: id) {
-                                    Text(preview).foregroundStyle(.secondary).textSelection(.enabled)
-                                }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(vm.items.indices, id: \.self) { idx in
+                            let item = vm.items[idx]
+                            if let event = item.asEvent() {
+                                PinnedRow(event: event, room: room, onUnpin: { id in
+                                    Task { await room.unpin(eventId: id) }
+                                })
+                                .id(item.uniqueId().id)
                             }
-                            Spacer()
-                            Button {
-                                Task { await room.unpin(eventId: id) }
-                            } label: { Image(systemName: "pin.slash") }
-                            .help("Unpin")
                         }
-                        .padding(.vertical, 4)
                     }
+                    .padding()
                 }
             }
         }
-        .frame(width: 600, height: 480)
+        .frame(width: 640, height: 540)
+        .task { await vm.open() }
+        .onDisappear { vm.close() }
     }
+}
 
-    /// Try to find a body for the event by scanning the current timeline. May be nil if
-    /// the message isn't in our cached window — that's fine, we still show the ID.
-    private func preview(for id: String) -> String? {
-        for item in room.pinnedEventCandidates() {
-            if let body = item.bodyForEventId(id) { return body }
-        }
+private struct PinnedRow: View {
+    let event: EventTimelineItem
+    @ObservedObject var room: RoomVM
+    let onUnpin: (String) -> Void
+
+    @EnvironmentObject private var nicknames: NicknameStore
+
+    private var eventId: String? {
+        if case .eventId(let id) = event.eventOrTransactionId { return id }
         return nil
     }
-}
 
-import MatrixRustSDK
+    private var senderName: String {
+        let serverName: String
+        if case .ready(let name, _, _) = event.senderProfile, let n = name {
+            serverName = n
+        } else {
+            serverName = event.sender
+        }
+        return nicknames.displayName(for: event.sender, fallback: serverName)
+    }
 
-extension RoomVM {
-    fileprivate func pinnedEventCandidates() -> [TimelineItem] { items }
-}
+    private var senderAvatar: String? {
+        if case .ready(_, _, let avatar) = event.senderProfile { return avatar }
+        return nil
+    }
 
-extension TimelineItem {
-    fileprivate func bodyForEventId(_ targetId: String) -> String? {
-        guard let event = asEvent() else { return nil }
-        if case .eventId(let id) = event.eventOrTransactionId, id == targetId {
-            if case .msgLike(let content) = event.content,
-               case .message(let msg) = content.kind {
-                return msg.body
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Avatar(name: senderName, mxc: senderAvatar, size: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(senderName).font(.callout.bold())
+                    Text(timeStr).font(.caption2).foregroundStyle(.tertiary)
+                }
+                bodyView
+            }
+            Spacer()
+            if let id = eventId {
+                Button { onUnpin(id) } label: {
+                    Image(systemName: "pin.slash")
+                }
+                .buttonStyle(.borderless)
+                .help("Unpin")
             }
         }
-        return nil
+    }
+
+    @ViewBuilder
+    private var bodyView: some View {
+        switch event.content {
+        case .msgLike(let content):
+            switch content.kind {
+            case .message(let msg):
+                switch msg.msgType {
+                case .text(let t):
+                    Text(MarkdownRenderer.render(body: t.body, formatted: t.formatted))
+                        .textSelection(.enabled)
+                case .notice(let n):
+                    Text(MarkdownRenderer.render(body: n.body, formatted: n.formatted))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                case .emote(let e):
+                    Text("* \(senderName) ").italic()
+                        + Text(MarkdownRenderer.render(body: e.body, formatted: e.formatted)).italic()
+                case .image(let img):
+                    Text("🖼 \(img.caption ?? img.filename)").foregroundStyle(.secondary)
+                case .file(let f):
+                    Text("📎 \(f.filename)").foregroundStyle(.secondary)
+                default:
+                    Text("(\(msg.body))").foregroundStyle(.secondary)
+                }
+            case .redacted:
+                Text("(message deleted)").italic().foregroundStyle(.tertiary)
+            case .unableToDecrypt:
+                Text("🔒 Encrypted — not decrypted").italic().foregroundStyle(.secondary)
+            default:
+                Text("(unsupported)").foregroundStyle(.tertiary)
+            }
+        default:
+            Text("(non-message event)").foregroundStyle(.tertiary)
+        }
+    }
+
+    private var timeStr: String {
+        let date = Date(timeIntervalSince1970: TimeInterval(event.timestamp) / 1000.0)
+        let f = DateFormatter()
+        f.dateStyle = .short; f.timeStyle = .short
+        return f.string(from: date)
     }
 }

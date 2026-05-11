@@ -109,11 +109,42 @@ private struct EmptyDetailView: View {
                 stateDot
                 Text(stateLabel).foregroundStyle(.tertiary)
             }
+            if session.sweepActive, session.sweepProgress.total > 0 {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading history \(session.sweepProgress.current) / \(session.sweepProgress.total) rooms")
+                        .font(.caption).foregroundStyle(.tertiary)
+                }
+            }
+            HStack(spacing: 6) {
+                verificationDot
+                Text(verificationLabel).font(.caption).foregroundStyle(.tertiary)
+            }
             if let me = session.currentUserId {
                 Text(me).font(.caption).foregroundStyle(.tertiary)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var verificationDot: some View {
+        let c: Color = {
+            switch session.verificationState {
+            case .verified: return .green
+            case .unverified: return .orange
+            case .unknown: return .gray
+            }
+        }()
+        Circle().fill(c).frame(width: 8, height: 8)
+    }
+
+    private var verificationLabel: String {
+        switch session.verificationState {
+        case .verified: return "This device is verified"
+        case .unverified: return "This device is not verified — use Recover Encryption Keys"
+        case .unknown: return "Verification state unknown"
+        }
     }
 
     @ViewBuilder

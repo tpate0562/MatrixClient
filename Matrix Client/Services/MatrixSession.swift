@@ -18,9 +18,16 @@ final class MatrixSession: ObservableObject {
     private var syncService: SyncService?
     private var roomListService: RoomListService?
     private var entriesResult: RoomListEntriesWithDynamicAdaptersResult?
+    private var entriesStreamHandle: TaskHandle?
     private var syncStateHandle: TaskHandle?
     private var recoveryStateHandle: TaskHandle?
+    private var verificationStateHandle: TaskHandle?
     private var listenerBox: RoomListListener?
+    private var backgroundSweepTask: Task<Void, Never>?
+    private var sweptRoomIds: Set<String> = []
+    @Published private(set) var verificationState: VerificationState = .unknown
+    @Published private(set) var sweepActive: Bool = false
+    @Published private(set) var sweepProgress: (current: Int, total: Int) = (0, 0)
 
     var currentUserId: String? { session?.userId }
     var isAuthenticated: Bool { session != nil }
@@ -39,9 +46,12 @@ final class MatrixSession: ObservableObject {
         let paths = try sessionPaths()
         let builder = ClientBuilder()
             .sessionPaths(dataPath: paths.data, cachePath: paths.cache)
-            .autoEnableBackups(autoEnableBackups: false)
-            .autoEnableCrossSigning(autoEnableCrossSigning: false)
-            .backupDownloadStrategy(backupDownloadStrategy: .afterDecryptionFailure)
+            // Cross-sign this device automatically once we have the user's master key
+            // (e.g. after the user enters their recovery key). Without this, every
+            // message we send shows as "unverified" in other clients.
+            .autoEnableCrossSigning(autoEnableCrossSigning: true)
+            .autoEnableBackups(autoEnableBackups: true)
+            .backupDownloadStrategy(backupDownloadStrategy: .oneShot)
             .serverNameOrHomeserverUrl(serverNameOrUrl: input.trimmingCharacters(in: .whitespaces))
         return try await builder.build()
     }
@@ -87,7 +97,10 @@ final class MatrixSession: ObservableObject {
         }
     }
 
-    /// Resume a saved session on app launch.
+    /// Resume a saved session on app launch. We deliberately do NOT clear the keychain
+    /// on failure — a transient network blip would log the user out and force a fresh
+    /// device registration on next launch, which loses encryption keys + history. Keep
+    /// the session and let the user retry via the lock/login UI.
     func restore(session: Session) async {
         do {
             let client = try await makeClient(homeserverUrlOrServerName: session.homeserverUrl)
@@ -95,7 +108,6 @@ final class MatrixSession: ObservableObject {
             try await activate(client: client, session: session)
         } catch {
             self.lastError = "Auto-restore failed: \(describe(error))"
-            KeychainStore.clear()
         }
     }
 
@@ -124,9 +136,11 @@ final class MatrixSession: ObservableObject {
             Task { @MainActor in self?.handleRoomListUpdates(updates) }
         }
         self.listenerBox = listener
-        let result = roomList.entriesWithDynamicAdapters(pageSize: 200, listener: listener)
+        let result = roomList.entriesWithDynamicAdapters(pageSize: 500, listener: listener)
         _ = result.controller().setFilter(kind: .nonLeft)
-        _ = result.entriesStream()  // keep alive — retained via 'result' below
+        // CRITICAL: hold the entries stream TaskHandle, otherwise the SDK stops forwarding
+        // room list updates to our listener (the handle owns the subscription).
+        self.entriesStreamHandle = result.entriesStream()
         self.entriesResult = result
 
         // Recovery state listener (so the UI can prompt for the recovery key)
@@ -137,7 +151,70 @@ final class MatrixSession: ObservableObject {
         recoveryStateHandle = encryption.recoveryStateListener(listener: recoveryListener)
         self.recoveryState = encryption.recoveryState()
 
+        // Device verification state.
+        let verificationListener = VerificationObserver { [weak self] state in
+            Task { @MainActor in self?.verificationState = state }
+        }
+        verificationStateHandle = encryption.verificationStateListener(listener: verificationListener)
+        self.verificationState = encryption.verificationState()
+
         await syncService.start()
+
+        // Kick off background pagination so every joined room ends up with full history
+        // in the SDK's SQLite cache.
+        startBackgroundSweep()
+    }
+
+    /// Walk through every joined room in the background and paginate it to exhaustion.
+    /// Processes one room at a time so we don't hammer the server, and remembers which
+    /// rooms have already been swept for this session.
+    func startBackgroundSweep() {
+        if let t = backgroundSweepTask, !t.isCancelled { return }
+        guard let roomListService else { return }
+        backgroundSweepTask = Task { [weak self, roomListService] in
+            // Soft delay so initial sync settles before we start hammering.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            while let self, !Task.isCancelled {
+                let pending = await MainActor.run {
+                    self.roomOrder.filter { !self.sweptRoomIds.contains($0) }
+                }
+                if pending.isEmpty {
+                    await MainActor.run {
+                        self.sweepActive = false
+                        self.sweepProgress = (0, 0)
+                    }
+                    break
+                }
+                await MainActor.run {
+                    self.sweepActive = true
+                    self.sweepProgress = (
+                        self.roomOrder.count - pending.count,
+                        self.roomOrder.count
+                    )
+                }
+                for roomId in pending {
+                    if Task.isCancelled { break }
+                    do {
+                        let sdkRoom = try roomListService.room(roomId: roomId)
+                        let timeline = try await sdkRoom.timeline()
+                        var more = true
+                        var pages = 0
+                        while more && pages < 200 && !Task.isCancelled {
+                            more = (try? await timeline.paginateBackwards(numEvents: 100)) ?? false
+                            pages += 1
+                            try? await Task.sleep(nanoseconds: 100_000_000)
+                        }
+                    } catch {
+                        // Skip rooms we can't paginate; e.g. just-joined ones.
+                    }
+                    await MainActor.run {
+                        self.sweptRoomIds.insert(roomId)
+                        let done = self.sweptRoomIds.intersection(Set(self.roomOrder)).count
+                        self.sweepProgress = (done, self.roomOrder.count)
+                    }
+                }
+            }
+        }
     }
 
     func logout() async {
@@ -155,10 +232,17 @@ final class MatrixSession: ObservableObject {
     }
 
     private func stop() async throws {
+        backgroundSweepTask?.cancel()
+        backgroundSweepTask = nil
         syncStateHandle = nil
         recoveryStateHandle = nil
+        verificationStateHandle = nil
+        entriesStreamHandle = nil
         entriesResult = nil
         listenerBox = nil
+        sweptRoomIds = []
+        sweepActive = false
+        sweepProgress = (0, 0)
         await syncService?.stop()
         syncService = nil
         roomListService = nil
@@ -276,10 +360,17 @@ final class MatrixSession: ObservableObject {
     // MARK: - Encryption / recovery
 
     /// Use the user's recovery key (or passphrase derived recovery key) to restore identity
-    /// + key backup, then the SDK will decrypt past messages as keys arrive.
+    /// + key backup, then the SDK will decrypt past messages as keys arrive. After recover
+    /// we wait for E2EE init tasks (cross-signing self-sign etc.) so verification flips to
+    /// `verified` for this device.
     func recover(withKey key: String) async {
         guard let enc = client?.encryption() else { return }
-        do { try await enc.recover(recoveryKey: key) }
+        do {
+            try await enc.recover(recoveryKey: key)
+            await enc.waitForE2eeInitializationTasks()
+            self.verificationState = enc.verificationState()
+            self.recoveryState = enc.recoveryState()
+        }
         catch { lastError = describe(error) }
     }
 
@@ -343,6 +434,12 @@ final class RecoveryStateObserver: RecoveryStateListener, @unchecked Sendable {
     let cb: @Sendable (RecoveryState) -> Void
     init(_ cb: @escaping @Sendable (RecoveryState) -> Void) { self.cb = cb }
     func onUpdate(status: RecoveryState) { cb(status) }
+}
+
+final class VerificationObserver: VerificationStateListener, @unchecked Sendable {
+    let cb: @Sendable (VerificationState) -> Void
+    init(_ cb: @escaping @Sendable (VerificationState) -> Void) { self.cb = cb }
+    func onUpdate(status: VerificationState) { cb(status) }
 }
 
 final class RoomListListener: RoomListEntriesListener, @unchecked Sendable {

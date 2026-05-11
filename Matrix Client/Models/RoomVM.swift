@@ -197,28 +197,18 @@ final class RoomVM: ObservableObject, Identifiable {
 
     func send(_ text: String) async {
         guard let timeline else { return }
-        let content = MessageContent(
-            msgType: .text(content: TextMessageContent(body: text, formatted: nil)),
-            body: text,
-            isEdited: false,
-            mentions: nil
-        )
+        // The SDK converts the markdown body to HTML and populates formatted_body, so other
+        // clients render the formatting correctly.
+        let msg = messageEventContentFromMarkdown(md: text)
         do {
-            let msg = try contentWithoutRelationFromMessage(message: content)
             _ = try await timeline.send(msg: msg)
         } catch { session?.lastError = describe(error) }
     }
 
     func sendReply(to eventId: String, text: String) async {
         guard let timeline else { return }
-        let content = MessageContent(
-            msgType: .text(content: TextMessageContent(body: text, formatted: nil)),
-            body: text,
-            isEdited: false,
-            mentions: nil
-        )
+        let msg = messageEventContentFromMarkdown(md: text)
         do {
-            let msg = try contentWithoutRelationFromMessage(message: content)
             try await timeline.sendReply(msg: msg, eventId: eventId)
         } catch { session?.lastError = describe(error) }
     }

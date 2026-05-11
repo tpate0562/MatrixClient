@@ -265,7 +265,7 @@ private struct EventRow: View {
         switch msg.msgType {
         case .text(let t):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(MarkdownRenderer.render(t.body))
+                Text(MarkdownRenderer.render(body: t.body, formatted: t.formatted))
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .tint(.blue)
@@ -274,7 +274,7 @@ private struct EventRow: View {
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .notice(let n):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(MarkdownRenderer.render(n.body))
+                Text(MarkdownRenderer.render(body: n.body, formatted: n.formatted))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .tint(.blue)
@@ -283,7 +283,7 @@ private struct EventRow: View {
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .emote(let e):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text("* \(senderName) ").italic() + Text(MarkdownRenderer.render(e.body)).italic()
+                (Text("* \(senderName) ").italic() + Text(MarkdownRenderer.render(body: e.body, formatted: e.formatted)).italic())
             }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .image(let img):
