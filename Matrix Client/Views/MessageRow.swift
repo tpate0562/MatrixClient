@@ -12,9 +12,7 @@ struct TimelineRow: View {
     let onRedact: (String) -> Void
     let onTogglePin: (String) -> Void
     let onShowSource: () -> Void
-
-    @EnvironmentObject private var session: MatrixSession
-    @State private var hovering = false
+    let onEditNickname: (String, String) -> Void
 
     var body: some View {
         if let virtual = item.asVirtual() {
@@ -23,15 +21,14 @@ struct TimelineRow: View {
             EventRow(
                 event: event,
                 room: room,
-                hovering: $hovering,
                 onReact: onReact,
                 onQuickReact: onQuickReact,
                 onReply: onReply,
                 onRedact: onRedact,
                 onTogglePin: onTogglePin,
-                onShowSource: onShowSource
+                onShowSource: onShowSource,
+                onEditNickname: onEditNickname
             )
-            .onHover { hovering = $0 }
         }
     }
 }
@@ -44,36 +41,30 @@ private struct VirtualRow: View {
         case .dateDivider(let ts):
             let date = Date(timeIntervalSince1970: TimeInterval(ts) / 1000.0)
             let df = makeDateFormatter()
-            return AnyView(
-                HStack {
-                    Spacer()
-                    Text(df.string(from: date))
-                        .font(.caption.bold())
-                        .padding(.horizontal, 10).padding(.vertical, 3)
-                        .background(Color.secondary.opacity(0.15))
-                        .clipShape(Capsule())
-                    Spacer()
-                }
-                .padding(.vertical, 6)
-            )
+            HStack {
+                Spacer()
+                Text(df.string(from: date))
+                    .font(.caption.bold())
+                    .padding(.horizontal, 10).padding(.vertical, 3)
+                    .background(Color.secondary.opacity(0.15))
+                    .clipShape(Capsule())
+                Spacer()
+            }
+            .padding(.vertical, 6)
         case .readMarker:
-            return AnyView(
-                HStack {
-                    Rectangle().fill(Color.accentColor.opacity(0.5)).frame(height: 1)
-                    Text("New").font(.caption2).foregroundStyle(.tint)
-                    Rectangle().fill(Color.accentColor.opacity(0.5)).frame(height: 1)
-                }
-                .padding(.vertical, 4)
-            )
+            HStack {
+                Rectangle().fill(Color.accentColor.opacity(0.5)).frame(height: 1)
+                Text("New").font(.caption2).foregroundStyle(.tint)
+                Rectangle().fill(Color.accentColor.opacity(0.5)).frame(height: 1)
+            }
+            .padding(.vertical, 4)
         case .timelineStart:
-            return AnyView(
-                HStack {
-                    Spacer()
-                    Text("Start of room").font(.caption2).foregroundStyle(.tertiary)
-                    Spacer()
-                }
-                .padding(.vertical, 6)
-            )
+            HStack {
+                Spacer()
+                Text("Start of room").font(.caption2).foregroundStyle(.tertiary)
+                Spacer()
+            }
+            .padding(.vertical, 6)
         }
     }
 
@@ -88,24 +79,32 @@ private struct VirtualRow: View {
 private struct EventRow: View {
     let event: EventTimelineItem
     @ObservedObject var room: RoomVM
-    @Binding var hovering: Bool
     let onReact: (String) -> Void
     let onQuickReact: (String, String) -> Void
     let onReply: (String) -> Void
     let onRedact: (String) -> Void
     let onTogglePin: (String) -> Void
     let onShowSource: () -> Void
+    let onEditNickname: (String, String) -> Void
 
     @EnvironmentObject private var session: MatrixSession
+    @EnvironmentObject private var nicknames: NicknameStore
+    @State private var hovering = false
+    @State private var hoverX: CGFloat?
 
     private var eventId: String? {
         if case .eventId(let id) = event.eventOrTransactionId { return id }
         return nil
     }
 
-    private var senderName: String {
+    private var serverSenderName: String {
         if case .ready(let name, _, _) = event.senderProfile, let n = name { return n }
         return event.sender
+    }
+
+    /// Local nickname if set, otherwise the server-provided display name.
+    private var senderName: String {
+        nicknames.displayName(for: event.sender, fallback: serverSenderName)
     }
 
     private var senderAvatar: String? {
@@ -122,26 +121,42 @@ private struct EventRow: View {
         Date(timeIntervalSince1970: TimeInterval(event.timestamp) / 1000.0)
     }
 
+    private var isOwn: Bool { event.isOwn }
+
     var body: some View {
-        switch event.content {
-        case .msgLike(let content):
-            messageRow(content: content)
-        case .roomMembership(let userId, let userDisplayName, let change, _):
-            stateLine(membershipLine(userId: userId, name: userDisplayName, change: change))
-        case .profileChange(let displayName, let prev, _, _):
-            let who = prev ?? "Someone"
-            let line = displayName.map { "\(who) is now \($0)" } ?? "\(who) updated their profile"
-            stateLine(line)
-        case .state(_, let content):
-            stateLine(stateSummary(content))
-        case .failedToParseMessageLike(let type, _):
-            stateLine("(unparseable \(type))")
-        case .failedToParseState(let type, _, _):
-            stateLine("(unparseable state \(type))")
-        case .callInvite:
-            stateLine("\(senderName) started a call")
-        case .rtcNotification:
-            stateLine("\(senderName) — call event")
+        Group {
+            switch event.content {
+            case .msgLike(let content):
+                messageRow(content: content)
+            case .roomMembership(let userId, let userDisplayName, let change, _):
+                stateLine(membershipLine(userId: userId, name: userDisplayName, change: change))
+            case .profileChange(let displayName, let prev, _, _):
+                let who = prev ?? "Someone"
+                let line = displayName.map { "\(who) is now \($0)" } ?? "\(who) updated their profile"
+                stateLine(line)
+            case .state(_, let content):
+                stateLine(stateSummary(content))
+            case .failedToParseMessageLike(let type, _):
+                stateLine("(unparseable \(type))")
+            case .failedToParseState(let type, _, _):
+                stateLine("(unparseable state \(type))")
+            case .callInvite:
+                stateLine("\(senderName) started a call")
+            case .rtcNotification:
+                stateLine("\(senderName) — call event")
+            }
+        }
+        // Make the entire row's horizontal stripe hover-detectable, not just the content.
+        .contentShape(Rectangle())
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let loc):
+                hovering = true
+                hoverX = loc.x
+            case .ended:
+                hovering = false
+                hoverX = nil
+            }
         }
     }
 
@@ -150,26 +165,99 @@ private struct EventRow: View {
     @ViewBuilder
     private func messageRow(content: MsgLikeContent) -> some View {
         HStack(alignment: .top, spacing: 8) {
-            Avatar(name: senderName, mxc: senderAvatar, size: 32)
-            VStack(alignment: .leading, spacing: 2) {
-                senderLine
-                kindBody(content.kind, content: content)
-                reactionsRow(content.reactions)
+            if isOwn {
+                // Right-aligned own message: spacer pushes content to the right.
+                Spacer(minLength: 60)
+                VStack(alignment: .trailing, spacing: 2) {
+                    senderLine
+                    kindBody(content.kind, content: content, ownAlignment: .trailing)
+                    reactionsRow(content.reactions, alignment: .trailing)
+                }
+                Avatar(name: senderName, mxc: senderAvatar, size: 32)
+            } else {
+                Avatar(name: senderName, mxc: senderAvatar, size: 32)
+                VStack(alignment: .leading, spacing: 2) {
+                    senderLine
+                    kindBody(content.kind, content: content, ownAlignment: .leading)
+                    reactionsRow(content.reactions, alignment: .leading)
+                }
+                Spacer(minLength: 60)
             }
-            Spacer()
-            trailingActions
         }
         .padding(.vertical, 1)
-        .background(
-            isPinned ? Color.yellow.opacity(0.08) : (hovering ? Color.secondary.opacity(0.05) : Color.clear)
-        )
+        .padding(.horizontal, 4)
+        .background(rowBackground)
+        .overlay(alignment: .topLeading) { hoverActionsOverlay }
+        .contextMenu {
+            Button("Set Nickname for \(serverSenderName)…") {
+                onEditNickname(event.sender, serverSenderName)
+            }
+        }
     }
 
     @ViewBuilder
-    private func kindBody(_ kind: MsgLikeKind, content: MsgLikeContent) -> some View {
+    private var rowBackground: some View {
+        if isPinned {
+            Color.yellow.opacity(0.08)
+        } else if hovering {
+            Color.secondary.opacity(0.05)
+        } else {
+            Color.clear
+        }
+    }
+
+    /// Action bubble that follows the cursor's X position so it's always reachable
+    /// regardless of where on the row you came in. Animated so it feels smooth.
+    @ViewBuilder
+    private var hoverActionsOverlay: some View {
+        if hovering, let eid = eventId, let x = hoverX {
+            HStack(spacing: 0) {
+                Color.clear.frame(width: max(0, x - 60))
+                hoverActions(eid: eid)
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 2)
+            .allowsHitTesting(true)
+            .animation(.easeOut(duration: 0.12), value: x)
+        }
+    }
+
+    @ViewBuilder
+    private func hoverActions(eid: String) -> some View {
+        HStack(spacing: 4) {
+            Button { onQuickReact(eid, "👍") } label: { Text("👍").font(.system(size: 13)) }
+                .buttonStyle(.plain).help("React 👍")
+            Button { onReact(eid) } label: { Image(systemName: "face.smiling") }
+                .buttonStyle(.plain).help("React")
+            Menu {
+                if event.canBeRepliedTo {
+                    Button("Reply") { onReply(eid) }
+                }
+                Button(isPinned ? "Unpin" : "Pin") { onTogglePin(eid) }
+                Button("View Source", action: onShowSource)
+                Button("Set Nickname for \(serverSenderName)…") {
+                    onEditNickname(event.sender, serverSenderName)
+                }
+                if event.isOwn || event.isEditable {
+                    Divider()
+                    Button("Redact", role: .destructive) { onRedact(eid) }
+                }
+            } label: { Image(systemName: "ellipsis") }
+            .menuStyle(.borderlessButton)
+            .frame(width: 22)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(.thickMaterial)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.15), radius: 3, y: 1)
+    }
+
+    @ViewBuilder
+    private func kindBody(_ kind: MsgLikeKind, content: MsgLikeContent, ownAlignment: HorizontalAlignment) -> some View {
         switch kind {
         case .message(let msg):
-            messageContent(msg)
+            messageContent(msg, alignment: ownAlignment)
         case .sticker(let body, _, _):
             Text("🪧 Sticker: \(body)").italic().foregroundStyle(.secondary)
         case .poll(let question, _, _, _, _, _, _):
@@ -186,50 +274,61 @@ private struct EventRow: View {
     }
 
     @ViewBuilder
-    private func messageContent(_ msg: MessageContent) -> some View {
+    private func messageContent(_ msg: MessageContent, alignment: HorizontalAlignment) -> some View {
+        let bubbleAlignment: Alignment = (alignment == .trailing) ? .trailing : .leading
         switch msg.msgType {
         case .text(let t):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(t.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                 if msg.isEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
             }
+            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .notice(let n):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(n.body).foregroundStyle(.secondary).textSelection(.enabled)
                 if msg.isEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
             }
+            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .emote(let e):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text("* \(senderName) \(e.body)").italic().textSelection(.enabled)
             }
+            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .image(let img):
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: alignment, spacing: 4) {
                 Button(action: { downloadAndOpen(source: img.source, filename: img.filename) }) {
-                    MxcImage(mxc: img.source.url(), maxWidth: 360, maxHeight: 240)
+                    MxcImage(source: img.source, maxWidth: 360, maxHeight: 240)
                 }
                 .buttonStyle(.plain)
                 if let cap = img.caption, !cap.isEmpty {
                     Text(cap).font(.caption2).foregroundStyle(.tertiary)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .video(let v):
             attachmentChip(systemName: "play.rectangle.fill",
                            label: v.caption ?? v.filename,
                            source: v.source, filename: v.filename)
+            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .audio(let a):
             attachmentChip(systemName: "waveform",
                            label: a.caption ?? a.filename,
                            source: a.source, filename: a.filename)
+            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .file(let f):
             attachmentChip(systemName: "doc.fill",
                            label: f.caption ?? f.filename,
                            source: f.source, filename: f.filename)
+            .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .gallery(let g):
             Text("🖼 Gallery (\(g.itemtypes.count) items)").italic().foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .location(let l):
             Text("📍 \(l.body)").italic().foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .other(_, let body):
             Text(body).textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         }
     }
 
@@ -278,7 +377,7 @@ private struct EventRow: View {
     // MARK: - State + membership lines
 
     private func membershipLine(userId: String, name: String?, change: MembershipChange?) -> String {
-        let who = name ?? userId
+        let who = nicknames.displayName(for: userId, fallback: name)
         guard let change else { return "\(who) updated membership" }
         switch change {
         case .joined: return "\(who) joined"
@@ -342,12 +441,20 @@ private struct EventRow: View {
 
     private var senderLine: some View {
         HStack(spacing: 6) {
-            Text(senderName)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(senderColor(for: event.sender))
+            if !isOwn {
+                Text(senderName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(senderColor(for: event.sender))
+                    .onTapGesture(count: 2) { onEditNickname(event.sender, serverSenderName) }
+            }
             Text(timeFull(date))
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
+            if isOwn {
+                Text("You")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(senderColor(for: event.sender))
+            }
             if isPinned {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
@@ -361,41 +468,19 @@ private struct EventRow: View {
     }
 
     @ViewBuilder
-    private func reactionsRow(_ reactions: [Reaction]) -> some View {
+    private func reactionsRow(_ reactions: [Reaction], alignment: HorizontalAlignment) -> some View {
         if !reactions.isEmpty, let eid = eventId {
             let myId = session.currentUserId
-            ReactionsBar(
-                reactions: reactions,
-                myUserId: myId,
-                onTap: { key in onQuickReact(eid, key) }
-            )
-            .padding(.top, 2)
-        }
-    }
-
-    @ViewBuilder
-    private var trailingActions: some View {
-        if hovering, let eid = eventId {
-            HStack(spacing: 4) {
-                Button { onQuickReact(eid, "👍") } label: { Text("👍") }
-                    .buttonStyle(.plain).help("React 👍")
-                Button { onReact(eid) } label: { Image(systemName: "face.smiling") }
-                    .buttonStyle(.plain).help("React")
-                Menu {
-                    if event.canBeRepliedTo {
-                        Button("Reply") { onReply(eid) }
-                    }
-                    Button(isPinned ? "Unpin" : "Pin") { onTogglePin(eid) }
-                    Button("View Source", action: onShowSource)
-                    if event.isOwn || event.isEditable {
-                        Divider()
-                        Button("Redact", role: .destructive) { onRedact(eid) }
-                    }
-                } label: { Image(systemName: "ellipsis") }
-                .menuStyle(.borderlessButton)
-                .frame(width: 22)
+            HStack {
+                if alignment == .trailing { Spacer() }
+                ReactionsBar(
+                    reactions: reactions,
+                    myUserId: myId,
+                    onTap: { key in onQuickReact(eid, key) }
+                )
+                if alignment == .leading { Spacer() }
             }
-            .padding(.trailing, 4)
+            .padding(.top, 2)
         }
     }
 
@@ -429,11 +514,10 @@ private struct EventRow: View {
         guard let client = session.client else { return }
         Task {
             do {
-                let mimeType = "application/octet-stream"
                 let handle = try await client.getMediaFile(
                     mediaSource: source,
                     filename: filename,
-                    mimeType: mimeType,
+                    mimeType: "application/octet-stream",
                     useCache: true,
                     tempDir: nil
                 )

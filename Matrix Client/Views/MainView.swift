@@ -35,14 +35,6 @@ struct MainView: View {
                             Label("New", systemImage: "square.and.pencil")
                         }
                     }
-                    ToolbarItem(placement: .navigation) {
-                        Button {
-                            Task { await session.logout() }
-                        } label: {
-                            Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
-                        }
-                        .help("Sign out")
-                    }
                 }
         } detail: {
             if let id = selectedRoomId, let vm = session.rooms[id] {
@@ -51,6 +43,18 @@ struct MainView: View {
             } else {
                 EmptyDetailView()
             }
+        }
+        .background {
+            // Hidden buttons that own the Cmd+↑ / Cmd+↓ shortcuts. Hidden so they don't render
+            // visibly, but the keyboard shortcuts still fire.
+            Group {
+                Button("Previous Room") { selectAdjacent(offset: -1) }
+                    .keyboardShortcut(.upArrow, modifiers: .command)
+                Button("Next Room") { selectAdjacent(offset: 1) }
+                    .keyboardShortcut(.downArrow, modifiers: .command)
+            }
+            .opacity(0)
+            .allowsHitTesting(false)
         }
         .sheet(isPresented: $showCreateRoom) {
             CreateRoomView(mode: roomCreationMode) { newId in
@@ -70,6 +74,23 @@ struct MainView: View {
         .sheet(isPresented: $showRecovery) {
             RecoverySheet()
         }
+    }
+
+    private func selectAdjacent(offset: Int) {
+        let order = session.roomOrder
+        guard !order.isEmpty else { return }
+        if let current = selectedRoomId, let idx = order.firstIndex(of: current) {
+            let next = (idx + offset).clamped(to: 0...(order.count - 1))
+            selectedRoomId = order[next]
+        } else {
+            selectedRoomId = order.first
+        }
+    }
+}
+
+private extension Comparable {
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
     }
 }
 

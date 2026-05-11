@@ -1,9 +1,11 @@
 import SwiftUI
 import MatrixRustSDK
 
-/// Loads an `mxc://` URI as a thumbnail through the SDK and renders it.
+/// Loads a `MediaSource` (mxc URI or encrypted file ref) as a thumbnail via the SDK.
+/// Encrypted attachments require the SDK's MediaSource, not just the mxc URL — `fromUrl`
+/// would lose the decryption keys.
 struct MxcImage: View {
-    let mxc: String?
+    let source: MediaSource?
     var maxWidth: CGFloat = 360
     var maxHeight: CGFloat = 280
     var corner: CGFloat = 8
@@ -27,8 +29,12 @@ struct MxcImage: View {
                     .overlay { ProgressView().controlSize(.small) }
             }
         }
-        .task(id: mxc) { await load() }
+        .task(id: sourceKey) { await load() }
     }
+
+    /// Use the underlying mxc URL as the identity — same media → same key, so .task only
+    /// re-fires when the actual content changes.
+    private var sourceKey: String { source?.url() ?? "" }
 
     private func placeholder(systemName: String) -> some View {
         ZStack {
@@ -43,9 +49,8 @@ struct MxcImage: View {
 
     private func load() async {
         image = nil; failed = false
-        guard let mxc, let client = session.client, mxc.hasPrefix("mxc://") else { failed = true; return }
+        guard let source, let client = session.client else { failed = true; return }
         do {
-            let source = try MediaSource.fromUrl(url: mxc)
             let data = try await client.getMediaThumbnail(
                 mediaSource: source,
                 width: UInt64(maxWidth * 2),
@@ -54,12 +59,12 @@ struct MxcImage: View {
             if let nsImage = NSImage(data: data) { self.image = nsImage }
             else { self.failed = true }
         } catch {
-            // Some servers don't support thumbnails for all content; try full.
-            if let source = try? MediaSource.fromUrl(url: mxc),
-               let data = try? await client.getMediaContent(mediaSource: source),
-               let img = NSImage(data: data) {
-                self.image = img
-            } else {
+            // Some servers don't support thumbnails for all content; try full payload.
+            do {
+                let data = try await client.getMediaContent(mediaSource: source)
+                if let nsImage = NSImage(data: data) { self.image = nsImage }
+                else { self.failed = true }
+            } catch {
                 self.failed = true
             }
         }

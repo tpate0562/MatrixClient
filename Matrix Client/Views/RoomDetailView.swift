@@ -11,6 +11,7 @@ struct RoomDetailView: View {
     @State private var emojiTargetEventId: String?
     @State private var showEmojiForCompose = false
     @State private var replyingToId: String?
+    @State private var nicknameTarget: NicknameTarget?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,7 +26,8 @@ struct RoomDetailView: View {
                 Button { showPins = true } label: {
                     Label("Pinned (\(room.pinnedEventIds.count))", systemImage: "pin")
                 }
-                .help("Pinned messages")
+                .keyboardShortcut("p", modifiers: .command)
+                .help("Pinned messages (⌘P)")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { showAdmin = true } label: {
@@ -61,10 +63,17 @@ struct RoomDetailView: View {
                 draft += key
             }
         }
+        .sheet(item: $nicknameTarget) { target in
+            NicknameEditor(userId: target.userId, currentName: target.fallbackName)
+        }
         .task(id: room.id) {
             await room.openTimeline()
             await room.markAsRead()
         }
+    }
+
+    private func editNickname(userId: String, name: String) {
+        nicknameTarget = NicknameTarget(userId: userId, fallbackName: name)
     }
 
     private var header: some View {
@@ -109,7 +118,8 @@ struct RoomDetailView: View {
                             onReply: { id in replyingToId = id },
                             onRedact: { id in Task { await room.redact(eventId: id) } },
                             onTogglePin: { id in Task { await room.togglePin(eventId: id) } },
-                            onShowSource: { sourceItem = item }
+                            onShowSource: { sourceItem = item },
+                            onEditNickname: editNickname
                         )
                         .id(item.uniqueId().id)
                     }
@@ -230,4 +240,10 @@ private struct TypingDots: View {
 private struct SourceWrapper: Identifiable {
     let item: TimelineItem
     var id: String { item.uniqueId().id }
+}
+
+struct NicknameTarget: Identifiable {
+    let userId: String
+    let fallbackName: String
+    var id: String { userId }
 }

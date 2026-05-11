@@ -4,12 +4,14 @@ import MatrixRustSDK
 struct RoomAdminView: View {
     @ObservedObject var room: RoomVM
     @EnvironmentObject private var session: MatrixSession
+    @EnvironmentObject private var nicknames: NicknameStore
     @Environment(\.dismiss) private var dismiss
 
     @State private var nameDraft: String = ""
     @State private var topicDraft: String = ""
     @State private var inviteUser: String = ""
     @State private var actionError: String?
+    @State private var nicknameTarget: NicknameTarget?
 
     private enum Tab: String, CaseIterable, Identifiable {
         case general = "General", members = "Members", danger = "Danger"
@@ -57,6 +59,9 @@ struct RoomAdminView: View {
             nameDraft = room.displayName
             topicDraft = room.topic ?? ""
             await room.loadMembers()
+        }
+        .sheet(item: $nicknameTarget) { target in
+            NicknameEditor(userId: target.userId, currentName: target.fallbackName)
         }
     }
 
@@ -144,15 +149,28 @@ struct RoomAdminView: View {
     private func memberRow(_ m: RoomMember) -> some View {
         let level = room.powerLevel(of: m.userId)
         let role = roleName(level)
+        let display = nicknames.displayName(for: m.userId, fallback: m.displayName)
         HStack {
-            Avatar(name: m.displayName ?? m.userId, mxc: m.avatarUrl, size: 28)
+            Avatar(name: display, mxc: m.avatarUrl, size: 28)
             VStack(alignment: .leading) {
-                Text(m.displayName ?? m.userId).font(.callout.bold())
+                HStack(spacing: 4) {
+                    Text(display).font(.callout.bold())
+                    if nicknames.nickname(for: m.userId) != nil {
+                        Image(systemName: "person.text.rectangle")
+                            .font(.caption2)
+                            .foregroundStyle(.tint)
+                            .help("Local nickname set")
+                    }
+                }
                 Text(m.userId).font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer()
             Text("\(role) · \(level)").font(.caption).foregroundStyle(.secondary)
             Menu {
+                Button("Set Nickname…") {
+                    nicknameTarget = NicknameTarget(userId: m.userId, fallbackName: m.displayName ?? m.userId)
+                }
+                Divider()
                 if room.myPowerLevel >= 100 || (room.myPowerLevel > level && room.myPowerLevel >= 50) {
                     Button("Make Admin (100)") { Task { await room.setPower(m.userId, level: 100) } }
                     Button("Make Moderator (50)") { Task { await room.setPower(m.userId, level: 50) } }
