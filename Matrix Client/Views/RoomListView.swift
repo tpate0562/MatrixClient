@@ -1,4 +1,5 @@
 import SwiftUI
+import MatrixRustSDK
 
 struct RoomListView: View {
     @EnvironmentObject private var session: MatrixSession
@@ -25,15 +26,15 @@ struct RoomListView: View {
             }
 
             List(selection: $selectedRoomId) {
-                ForEach(filtered(), id: \.id) { room in
-                    RoomRow(room: room)
-                        .tag(room.id)
+                ForEach(filtered(), id: \.id) { vm in
+                    RoomRow(vm: vm)
+                        .tag(vm.id)
                         .contextMenu {
                             Button("Mark as Read") {
-                                Task { await session.sendReadReceipt(roomId: room.id) }
+                                Task { await vm.markAsRead() }
                             }
                             Button("Leave Room", role: .destructive) {
-                                Task { await session.leave(roomId: room.id) }
+                                Task { await vm.leave() }
                             }
                         }
                 }
@@ -46,20 +47,20 @@ struct RoomListView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Invites").font(.caption.bold()).foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
-            ForEach(Array(session.invites.values), id: \.id) { room in
+            ForEach(Array(session.invites.values), id: \.id) { vm in
                 HStack {
                     VStack(alignment: .leading) {
-                        Text(room.displayName).font(.callout)
-                        Text(room.id).font(.caption2).foregroundStyle(.tertiary)
+                        Text(vm.displayName).font(.callout)
+                        Text(vm.id).font(.caption2).foregroundStyle(.tertiary)
                     }
                     Spacer()
                     Button("Join") {
-                        Task { await session.acceptInvite(room.id) }
+                        Task { await session.acceptInvite(vm.id) }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.mini)
                     Button("Reject") {
-                        Task { await session.rejectInvite(room.id) }
+                        Task { await session.rejectInvite(vm.id) }
                     }
                     .controlSize(.mini)
                 }
@@ -71,92 +72,70 @@ struct RoomListView: View {
         .padding(.vertical, 6)
     }
 
-    private func filtered() -> [Room] {
+    private func filtered() -> [RoomVM] {
         let base = session.roomOrder.compactMap { session.rooms[$0] }
         let f = filter.lowercased()
-        return base.filter { room in
-            // Section filter.
+        return base.filter { vm in
             switch section {
             case .all: break
-            case .dms: if !room.isDirect { return false }
-            case .rooms: if room.isDirect { return false }
+            case .dms: if !vm.isDirect { return false }
+            case .rooms: if vm.isDirect { return false }
             }
-            // Text filter.
             if f.isEmpty { return true }
-            return room.displayName.lowercased().contains(f) ||
-                   (room.topic ?? "").lowercased().contains(f) ||
-                   room.id.lowercased().contains(f)
+            return vm.displayName.lowercased().contains(f) ||
+                   (vm.topic ?? "").lowercased().contains(f) ||
+                   vm.id.lowercased().contains(f)
         }
     }
 }
 
 private struct RoomRow: View {
-    @ObservedObject var room: Room
+    @ObservedObject var vm: RoomVM
 
     var body: some View {
         HStack(spacing: 10) {
-            Avatar(name: room.displayName, mxc: room.avatarMxc, size: 32)
+            Avatar(name: vm.displayName, mxc: vm.avatarUrl, size: 32)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
-                    if room.isDirect {
+                    if vm.isDirect {
                         Image(systemName: "person.fill")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
-                    Text(room.displayName)
+                    Text(vm.displayName)
                         .lineLimit(1)
                         .font(.callout.weight(.medium))
-                    if room.isEncrypted {
+                    if vm.isEncrypted {
                         Image(systemName: "lock.fill")
                             .font(.caption2)
                             .foregroundStyle(.green)
                     }
                 }
-                if let preview = lastPreview() {
-                    Text(preview)
+                if let topic = vm.topic, !topic.isEmpty {
+                    Text(topic)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
             }
             Spacer()
-            if room.unreadCount > 0 {
-                Text("\(room.unreadCount)")
-                    .font(.caption.bold())
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(room.highlightCount > 0 ? Color.red : Color.accentColor)
-                    .foregroundColor(.white)
-                    .clipShape(Capsule())
-            }
         }
         .padding(.vertical, 2)
     }
-
-    private func lastPreview() -> String? {
-        for ev in room.timeline.reversed() {
-            switch ev.type {
-            case "m.room.message":
-                if let body = ev.messageBody { return body }
-            case "m.room.encrypted":
-                return "🔒 Encrypted message"
-            default: continue
-            }
-        }
-        return nil
-    }
 }
 
+/// Reusable avatar that loads an SDK-authenticated thumbnail via `client.getMediaThumbnail`.
 struct Avatar: View {
     let name: String
     let mxc: String?
     let size: CGFloat
     @EnvironmentObject private var session: MatrixSession
-    @State private var loaded: Image?
+    @State private var loaded: NSImage?
 
     var body: some View {
         Group {
             if let loaded {
-                loaded.resizable().scaledToFill()
+                Image(nsImage: loaded).resizable().scaledToFill()
             } else {
                 ZStack {
                     Circle().fill(colorForName(name))
@@ -173,17 +152,23 @@ struct Avatar: View {
 
     private func load() async {
         loaded = nil
-        guard let mxc, let creds = session.credentials else { return }
-        let api = session.api
-        guard let url = await api.thumbnailURL(homeserver: creds.homeserverURL, mxc: mxc, size: Int(size * 2)) else { return }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
+        guard let mxc, let client = session.client, mxc.hasPrefix("mxc://") else { return }
         do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            if let nsImage = NSImage(data: data) {
-                loaded = Image(nsImage: nsImage)
+            let source = try MediaSource.fromUrl(url: mxc)
+            let data = try await client.getMediaThumbnail(
+                mediaSource: source,
+                width: UInt64(size * 2),
+                height: UInt64(size * 2)
+            )
+            if let img = NSImage(data: data) { self.loaded = img }
+        } catch {
+            // Try full content as a fallback.
+            if let source = try? MediaSource.fromUrl(url: mxc),
+               let data = try? await client.getMediaContent(mediaSource: source),
+               let img = NSImage(data: data) {
+                self.loaded = img
             }
-        } catch {}
+        }
     }
 
     private func initials(_ s: String) -> String {

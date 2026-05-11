@@ -1,7 +1,8 @@
 import SwiftUI
+import MatrixRustSDK
 
 struct RoomAdminView: View {
-    @ObservedObject var room: Room
+    @ObservedObject var room: RoomVM
     @EnvironmentObject private var session: MatrixSession
     @Environment(\.dismiss) private var dismiss
 
@@ -47,24 +48,19 @@ struct RoomAdminView: View {
             }
             if let actionError {
                 Text(actionError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                    .font(.caption).foregroundStyle(.red)
                     .padding(.bottom, 8)
             }
         }
         .frame(width: 640, height: 560)
-        .onAppear {
-            nameDraft = room.name ?? ""
+        .task {
+            nameDraft = room.displayName
             topicDraft = room.topic ?? ""
+            await room.loadMembers()
         }
     }
 
     // MARK: - General
-
-    private var canChangeName: Bool {
-        myLevel >= room.powerLevelRequired(for: "m.room.name") &&
-        myLevel >= (powerLevelsContent["events"]?["m.room.name"]?.intValue.map(Int.init) ?? 50)
-    }
 
     @ViewBuilder
     private var generalTab: some View {
@@ -73,9 +69,9 @@ struct RoomAdminView: View {
                 HStack {
                     TextField("Room name", text: $nameDraft).textFieldStyle(.roundedBorder)
                     Button("Save") {
-                        Task { await session.setRoomName(nameDraft, roomId: room.id) }
+                        Task { await room.setName(nameDraft) }
                     }
-                    .disabled(nameDraft == (room.name ?? ""))
+                    .disabled(nameDraft == room.displayName)
                 }
             }
             Field(label: "Topic") {
@@ -84,7 +80,7 @@ struct RoomAdminView: View {
                         .lineLimit(1...4)
                         .textFieldStyle(.roundedBorder)
                     Button("Save") {
-                        Task { await session.setRoomTopic(topicDraft, roomId: room.id) }
+                        Task { await room.setTopic(topicDraft) }
                     }
                     .disabled(topicDraft == (room.topic ?? ""))
                 }
@@ -96,7 +92,7 @@ struct RoomAdminView: View {
                         .foregroundStyle(room.isEncrypted ? .green : .secondary)
                     Label(room.isDirect ? "Direct message" : "Group room",
                           systemImage: room.isDirect ? "person.fill" : "person.3.fill")
-                    Text("Joined: \(room.joinedMemberCount) · Invited: \(room.invitedMemberCount)")
+                    Text("Joined: \(room.joinedMembersCount)")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -113,78 +109,65 @@ struct RoomAdminView: View {
                     .textFieldStyle(.roundedBorder)
                 Button("Invite") {
                     Task {
-                        do {
-                            try await session.api.invite(roomId: room.id, userId: inviteUser)
-                            inviteUser = ""
-                        } catch { actionError = "\(error)" }
+                        await room.invite(inviteUser)
+                        inviteUser = ""
                     }
                 }
                 .disabled(inviteUser.isEmpty)
             }
             Divider()
-            ForEach(sortedMembers, id: \.0) { (userId, ev) in
-                memberRow(userId: userId, event: ev)
+            if room.membersLoaded {
+                ForEach(sortedMembers, id: \.userId) { m in
+                    memberRow(m)
+                }
+            } else {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Loading members…").foregroundStyle(.secondary)
+                }
             }
         }
     }
 
-    private var sortedMembers: [(String, MatrixEvent)] {
-        room.members
-            .filter { $0.value.content["membership"]?.stringValue == "join" }
+    private var sortedMembers: [RoomMember] {
+        room.members.values
+            .filter { $0.membership == .join }
             .sorted { a, b in
-                let la = room.powerLevel(of: a.key)
-                let lb = room.powerLevel(of: b.key)
+                let la = room.powerLevel(of: a.userId)
+                let lb = room.powerLevel(of: b.userId)
                 if la != lb { return la > lb }
-                return (room.memberDisplayName(a.key) ?? a.key) < (room.memberDisplayName(b.key) ?? b.key)
+                return (a.displayName ?? a.userId) < (b.displayName ?? b.userId)
             }
     }
 
     @ViewBuilder
-    private func memberRow(userId: String, event: MatrixEvent) -> some View {
-        let level = room.powerLevel(of: userId)
+    private func memberRow(_ m: RoomMember) -> some View {
+        let level = room.powerLevel(of: m.userId)
         let role = roleName(level)
-        let canModerate = myLevel > level && myLevel >= room.powerLevelRequired(for: "kick")
         HStack {
-            Avatar(name: room.memberDisplayName(userId) ?? userId,
-                   mxc: room.memberAvatar(userId), size: 28)
+            Avatar(name: m.displayName ?? m.userId, mxc: m.avatarUrl, size: 28)
             VStack(alignment: .leading) {
-                Text(room.memberDisplayName(userId) ?? userId).font(.callout.bold())
-                Text(userId).font(.caption2).foregroundStyle(.tertiary)
+                Text(m.displayName ?? m.userId).font(.callout.bold())
+                Text(m.userId).font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer()
             Text("\(role) · \(level)").font(.caption).foregroundStyle(.secondary)
             Menu {
-                if myLevel >= 100 || (myLevel > level && myLevel >= 50) {
-                    Button("Make Admin (100)") { setLevel(userId, 100) }
-                    Button("Make Moderator (50)") { setLevel(userId, 50) }
-                    Button("Reset to Default (0)") { setLevel(userId, 0) }
+                if room.myPowerLevel >= 100 || (room.myPowerLevel > level && room.myPowerLevel >= 50) {
+                    Button("Make Admin (100)") { Task { await room.setPower(m.userId, level: 100) } }
+                    Button("Make Moderator (50)") { Task { await room.setPower(m.userId, level: 50) } }
+                    Button("Reset to Default (0)") { Task { await room.setPower(m.userId, level: 0) } }
                 }
-                if canModerate {
+                if room.myPowerLevel > level {
                     Divider()
-                    Button("Kick") {
-                        Task {
-                            do { try await session.api.kick(roomId: room.id, userId: userId, reason: nil) }
-                            catch { actionError = "\(error)" }
-                        }
-                    }
-                    Button("Ban", role: .destructive) {
-                        Task {
-                            do { try await session.api.ban(roomId: room.id, userId: userId, reason: nil) }
-                            catch { actionError = "\(error)" }
-                        }
-                    }
+                    Button("Kick") { Task { await room.kick(m.userId) } }
+                    Button("Ban", role: .destructive) { Task { await room.ban(m.userId) } }
                 }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-            }
+            } label: { Image(systemName: "ellipsis.circle") }
             .menuStyle(.borderlessButton)
             .frame(width: 32)
         }
         .padding(.vertical, 2)
-    }
-
-    private func setLevel(_ userId: String, _ level: Int) {
-        Task { await session.setPowerLevel(userId: userId, level: level, roomId: room.id) }
     }
 
     private func roleName(_ level: Int) -> String {
@@ -203,24 +186,13 @@ struct RoomAdminView: View {
             Text("These actions can't be undone.").foregroundStyle(.secondary)
             Button(role: .destructive) {
                 Task {
-                    await session.leave(roomId: room.id)
+                    await room.leave()
                     dismiss()
                 }
             } label: {
                 Label("Leave Room", systemImage: "rectangle.portrait.and.arrow.right")
             }
         }
-    }
-
-    // MARK: - Helpers
-
-    private var myLevel: Int {
-        guard let me = session.currentUserId else { return 0 }
-        return room.powerLevel(of: me)
-    }
-
-    private var powerLevelsContent: JSONValue {
-        room.stateByKey[Room.StateKey(type: "m.room.power_levels", stateKey: "")]?.content ?? .object([:])
     }
 }
 

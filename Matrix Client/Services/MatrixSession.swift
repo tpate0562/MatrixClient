@@ -1,403 +1,366 @@
 import Foundation
-import SwiftUI
 import Combine
+import MatrixRustSDK
 
-/// The app's top-level model: holds credentials, the room map, and drives /sync.
-/// Owned by the App and injected into views via @EnvironmentObject.
+/// The app-level model. Owns one SDK `Client` + its `SyncService` and surfaces an observable
+/// room list. Per-room state (timeline, members, typing) lives in `RoomVM` instances.
 @MainActor
 final class MatrixSession: ObservableObject {
-    @Published private(set) var credentials: Credentials?
-    @Published private(set) var rooms: [String: Room] = [:]
-    @Published private(set) var roomOrder: [String] = []        // most recent activity first
-    @Published private(set) var invites: [String: Room] = [:]
-    @Published private(set) var directRoomIds: Set<String> = []
-    @Published private(set) var syncing: Bool = false
+    @Published private(set) var session: Session?
+    @Published private(set) var rooms: [String: RoomVM] = [:]
+    @Published private(set) var roomOrder: [String] = []
+    @Published private(set) var invites: [String: RoomVM] = [:]
+    @Published private(set) var syncState: SyncServiceState = .idle
     @Published var lastError: String?
+    @Published private(set) var recoveryState: RecoveryState = .unknown
 
-    let api: MatrixAPI
-    private var syncTask: Task<Void, Never>?
-    private var nextBatch: String?
+    private(set) var client: Client?
+    private var syncService: SyncService?
+    private var roomListService: RoomListService?
+    private var entriesResult: RoomListEntriesWithDynamicAdaptersResult?
+    private var syncStateHandle: TaskHandle?
+    private var recoveryStateHandle: TaskHandle?
+    private var listenerBox: RoomListListener?
 
-    var currentUserId: String? { credentials?.userId }
-    var isAuthenticated: Bool { credentials != nil }
+    var currentUserId: String? { session?.userId }
+    var isAuthenticated: Bool { session != nil }
 
     init() {
-        self.api = MatrixAPI()
-        if let creds = KeychainStore.load() {
-            self.credentials = creds
-            Task { await api.setHomeserver(creds.homeserverURL); await api.setToken(creds.accessToken) }
-            // Kick off sync on next run-loop tick once api is configured.
-            Task { await self.startSync() }
+        if let saved = KeychainStore.load() {
+            Task { await self.restore(session: saved) }
         }
     }
 
-    // MARK: - Auth
+    // MARK: - Lifecycle
 
+    /// Build a Client for a homeserver (no session yet). Used as the first step of any flow.
+    private func makeClient(homeserverUrlOrServerName input: String) async throws -> Client {
+        try await stop()
+        let paths = try sessionPaths()
+        let builder = ClientBuilder()
+            .sessionPaths(dataPath: paths.data, cachePath: paths.cache)
+            .autoEnableBackups(autoEnableBackups: false)
+            .autoEnableCrossSigning(autoEnableCrossSigning: false)
+            .backupDownloadStrategy(backupDownloadStrategy: .afterDecryptionFailure)
+            .serverNameOrHomeserverUrl(serverNameOrUrl: input.trimmingCharacters(in: .whitespaces))
+        return try await builder.build()
+    }
+
+    /// Password login flow.
     func login(homeserverInput: String, user: String, password: String) async {
         lastError = nil
         do {
-            let resolved = try await api.discoverHomeserver(from: homeserverInput)
-            let creds = try await api.login(homeserver: resolved, user: user, password: password)
-            self.credentials = creds
-            KeychainStore.save(creds)
-            await startSync()
+            let client = try await makeClient(homeserverUrlOrServerName: homeserverInput)
+            try await client.login(
+                username: user, password: password,
+                initialDeviceName: "Matrix Client (macOS)", deviceId: nil
+            )
+            let session = try client.session()
+            try await activate(client: client, session: session)
         } catch {
-            self.lastError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            self.lastError = describe(error)
         }
     }
 
-    /// Sign in using a pre-issued access token (e.g. copied from Element → Settings → Help & About).
-    /// Validates the token via `/account/whoami`, then persists and starts sync.
+    /// Access-token login. We need user/device IDs that match the token; the SDK gives us a
+    /// `Client` we can ask for them via whoami after restoring a hand-built `Session`. Since
+    /// `restoreSession` requires both, we first do a one-shot REST call to /account/whoami.
     func loginWithToken(homeserverInput: String, accessToken: String) async {
         lastError = nil
         do {
-            let resolved = try await api.discoverHomeserver(from: homeserverInput)
-            await api.setHomeserver(resolved)
-            await api.setToken(accessToken)
-            let who = try await api.whoami()
-            let creds = Credentials(
-                homeserverURL: resolved,
-                userId: who.user_id,
-                deviceId: who.device_id ?? "unknown",
-                accessToken: accessToken
+            let baseURL = try await resolveHomeserver(input: homeserverInput)
+            let who = try await whoami(homeserver: baseURL, token: accessToken)
+            let client = try await makeClient(homeserverUrlOrServerName: baseURL.absoluteString)
+            let session = Session(
+                accessToken: accessToken,
+                refreshToken: nil,
+                userId: who.userId,
+                deviceId: who.deviceId ?? "unknown-device",
+                homeserverUrl: baseURL.absoluteString,
+                oidcData: nil,
+                slidingSyncVersion: .native
             )
-            self.credentials = creds
-            KeychainStore.save(creds)
-            await startSync()
+            try await client.restoreSession(session: session)
+            try await activate(client: client, session: try client.session())
         } catch {
-            await api.setToken(nil)
-            self.lastError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            self.lastError = describe(error)
         }
+    }
+
+    /// Resume a saved session on app launch.
+    func restore(session: Session) async {
+        do {
+            let client = try await makeClient(homeserverUrlOrServerName: session.homeserverUrl)
+            try await client.restoreSession(session: session)
+            try await activate(client: client, session: session)
+        } catch {
+            self.lastError = "Auto-restore failed: \(describe(error))"
+            KeychainStore.clear()
+        }
+    }
+
+    /// Common path once a Client has a live session: start sync, wire listeners, expose state.
+    private func activate(client: Client, session: Session) async throws {
+        self.client = client
+        self.session = session
+        KeychainStore.save(session)
+
+        // Sync service
+        let syncBuilder = client.syncService()
+        let syncService = try await syncBuilder.finish()
+        self.syncService = syncService
+
+        // Observe sync state
+        let stateListener = SyncStateObserver { [weak self] state in
+            Task { @MainActor in self?.syncState = state }
+        }
+        syncStateHandle = syncService.state(listener: stateListener)
+
+        // Room list
+        let rls = syncService.roomListService()
+        self.roomListService = rls
+        let roomList = try await rls.allRooms()
+        let listener = RoomListListener { [weak self] updates in
+            Task { @MainActor in self?.handleRoomListUpdates(updates) }
+        }
+        self.listenerBox = listener
+        let result = roomList.entriesWithDynamicAdapters(pageSize: 200, listener: listener)
+        _ = result.controller().setFilter(kind: .nonLeft)
+        _ = result.entriesStream()  // keep alive — retained via 'result' below
+        self.entriesResult = result
+
+        // Recovery state listener (so the UI can prompt for the recovery key)
+        let recoveryListener = RecoveryStateObserver { [weak self] state in
+            Task { @MainActor in self?.recoveryState = state }
+        }
+        let encryption = client.encryption()
+        recoveryStateHandle = encryption.recoveryStateListener(listener: recoveryListener)
+        self.recoveryState = encryption.recoveryState()
+
+        await syncService.start()
     }
 
     func logout() async {
-        syncTask?.cancel()
-        syncTask = nil
-        try? await api.logout()
-        await api.setToken(nil)
-        KeychainStore.clear()
-        credentials = nil
-        rooms = [:]
-        invites = [:]
-        roomOrder = []
-        directRoomIds = []
-        nextBatch = nil
-    }
-
-    // MARK: - Sync loop
-
-    func startSync() async {
-        guard syncTask == nil else { return }
-        syncing = true
-        syncTask = Task { [weak self] in
-            await self?.runSyncLoop()
-        }
-    }
-
-    private func runSyncLoop() async {
-        // Initial sync — no timeout, fast turnaround.
-        while !Task.isCancelled {
-            do {
-                let resp = try await api.sync(since: nextBatch, timeout: nextBatch == nil ? 0 : 30000)
-                apply(resp)
-                nextBatch = resp.nextBatch
-            } catch {
-                if Task.isCancelled { break }
-                if case MatrixAPIError.http(let status, _, _) = error, status == 401 {
-                    // Token revoked — log out cleanly.
-                    await logout()
-                    break
-                }
-                self.lastError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-                // Backoff briefly before retrying.
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-            }
-        }
-        syncing = false
-    }
-
-    private func apply(_ resp: SyncResponse) {
-        // Account data — figure out which rooms are DMs.
-        for event in resp.accountData where event.type == "m.direct" {
-            var ids = Set<String>()
-            if let obj = event.content.objectValue {
-                for (_, val) in obj {
-                    for v in val.arrayValue ?? [] {
-                        if let id = v.stringValue { ids.insert(id) }
-                    }
-                }
-            }
-            directRoomIds = ids
-            for id in ids { rooms[id]?.isDirect = true }
-        }
-
-        // Joined rooms.
-        var touched: [String] = []
-        for (roomId, jr) in resp.join {
-            let room = rooms[roomId] ?? {
-                let r = Room(id: roomId)
-                rooms[roomId] = r
-                return r
-            }()
-            invites.removeValue(forKey: roomId)
-            room.membership = .join
-            room.isDirect = directRoomIds.contains(roomId) || room.isDirect
-            room.unreadCount = jr.unreadCount
-            room.highlightCount = jr.highlightCount
-            if !jr.heroes.isEmpty { room.heroes = jr.heroes }
-            if jr.joinedMemberCount > 0 { room.joinedMemberCount = jr.joinedMemberCount }
-            if jr.invitedMemberCount > 0 { room.invitedMemberCount = jr.invitedMemberCount }
-            if let pb = jr.prevBatch { room.prevBatch = pb }
-
-            // State first, then timeline.
-            for ev in jr.state { room.applyState(ev) }
-            for ev in jr.timeline { room.applyTimeline(ev) }
-            // Ephemeral (typing, receipts).
-            for ev in jr.ephemeral where ev.type == "m.typing" {
-                let ids = ev.content["user_ids"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-                var set = Set(ids)
-                if let me = currentUserId { set.remove(me) }
-                room.typingUserIds = set
-            }
-            // Trim timeline to a sane size to keep memory bounded.
-            if room.timeline.count > 500 {
-                room.timeline = Array(room.timeline.suffix(500))
-            }
-            if !jr.timeline.isEmpty { touched.append(roomId) }
-        }
-
-        // Stash to-device events; the future crypto layer will consume them.
-        if !resp.toDevice.isEmpty {
-            #if DEBUG
-            print("[sync] received \(resp.toDevice.count) to-device events (types: \(Set(resp.toDevice.map(\.type))))")
-            #endif
-        }
-
-        // Invites.
-        for (roomId, ir) in resp.invite {
-            let room = invites[roomId] ?? {
-                let r = Room(id: roomId)
-                invites[roomId] = r
-                return r
-            }()
-            room.membership = .invite
-            for ev in ir.inviteState { room.applyState(ev) }
-        }
-
-        // Leaves.
-        for (roomId, _) in resp.leave {
-            rooms.removeValue(forKey: roomId)
-            invites.removeValue(forKey: roomId)
-            roomOrder.removeAll { $0 == roomId }
-        }
-
-        // Rebuild room order — most recent activity first, then alphabetically.
-        var order = rooms.keys.sorted { a, b in
-            let ta = rooms[a]?.timeline.last?.originServerTs ?? 0
-            let tb = rooms[b]?.timeline.last?.originServerTs ?? 0
-            if ta != tb { return ta > tb }
-            return (rooms[a]?.displayName ?? a) < (rooms[b]?.displayName ?? b)
-        }
-        // Promote touched rooms.
-        for id in touched.reversed() where order.contains(id) {
-            order.removeAll { $0 == id }
-            order.insert(id, at: 0)
-        }
-        roomOrder = order
-    }
-
-    // MARK: - Convenience actions called from views
-
-    func sendMessage(_ text: String, in roomId: String) async {
-        guard !text.isEmpty else { return }
-        do { _ = try await api.sendMessage(roomId: roomId, text: text) }
-        catch { lastError = "\(error)" }
-    }
-
-    func toggleReaction(roomId: String, targetEventId: String, key: String) async {
-        guard let me = currentUserId, let room = rooms[roomId] else { return }
-        let existing = room.reactionsByTarget[targetEventId]?
-            .first { $0.sender == me && $0.key == key }
         do {
-            if let existing {
-                _ = try await api.redact(roomId: roomId, eventId: existing.eventId)
-            } else {
-                _ = try await api.sendReaction(roomId: roomId, targetEventId: targetEventId, key: key)
-            }
-        } catch { lastError = "\(error)" }
-    }
-
-    func redact(roomId: String, eventId: String) async {
-        do { _ = try await api.redact(roomId: roomId, eventId: eventId) }
-        catch { lastError = "\(error)" }
-    }
-
-    func togglePin(roomId: String, eventId: String) async {
-        guard let room = rooms[roomId] else { return }
-        var pins = room.pinnedEventIds
-        if let idx = pins.firstIndex(of: eventId) { pins.remove(at: idx) }
-        else { pins.append(eventId) }
-        do {
-            _ = try await api.setState(
-                roomId: roomId, type: "m.room.pinned_events", stateKey: "",
-                content: ["pinned": pins]
-            )
-        } catch { lastError = "\(error)" }
-    }
-
-    func setRoomName(_ name: String, roomId: String) async {
-        do {
-            _ = try await api.setState(roomId: roomId, type: "m.room.name", content: ["name": name])
-        } catch { lastError = "\(error)" }
-    }
-
-    func setRoomTopic(_ topic: String, roomId: String) async {
-        do {
-            _ = try await api.setState(roomId: roomId, type: "m.room.topic", content: ["topic": topic])
-        } catch { lastError = "\(error)" }
-    }
-
-    func setPowerLevel(userId: String, level: Int, roomId: String) async {
-        guard let room = rooms[roomId],
-              let pl = room.stateByKey[Room.StateKey(type: "m.room.power_levels", stateKey: "")] else {
-            lastError = "No power levels event in this room"
-            return
-        }
-        var content = pl.content.objectValue ?? [:]
-        var users = content["users"]?.objectValue ?? [:]
-        users[userId] = .int(Int64(level))
-        content["users"] = .object(users)
-        do {
-            let plain = jsonObject(content)
-            _ = try await api.setState(roomId: roomId, type: "m.room.power_levels", content: plain)
-        } catch { lastError = "\(error)" }
-    }
-
-    func leave(roomId: String) async {
-        do {
-            try await api.leaveRoom(roomId)
-            rooms.removeValue(forKey: roomId)
-            roomOrder.removeAll { $0 == roomId }
-        } catch { lastError = "\(error)" }
-    }
-
-    func acceptInvite(_ roomId: String) async {
-        do {
-            _ = try await api.joinRoom(roomId)
-            invites.removeValue(forKey: roomId)
-        } catch { lastError = "\(error)" }
-    }
-
-    func rejectInvite(_ roomId: String) async {
-        do {
-            try await api.leaveRoom(roomId)
-            invites.removeValue(forKey: roomId)
-        } catch { lastError = "\(error)" }
-    }
-
-    func createRoom(name: String?, topic: String?, isDirect: Bool,
-                    invite: [String], encrypted: Bool) async -> String? {
-        do {
-            let preset = isDirect ? "trusted_private_chat" : "private_chat"
-            let id = try await api.createRoom(name: name, topic: topic, isDirect: isDirect,
-                                              invite: invite, encrypted: encrypted, preset: preset)
-            if isDirect, !invite.isEmpty {
-                // Update m.direct account data so the other clients also mark it as a DM.
-                let target = invite[0]
-                var data: [String: [String]] = [:]
-                data[target] = [id]
-                _ = try? await api.setState(roomId: id, type: "m.direct", content: data)
-            }
-            return id
+            try await client?.logout()
         } catch {
-            lastError = "\(error)"
+            // Continue tearing down even if server logout fails.
+        }
+        try? await stop()
+        KeychainStore.clear()
+        session = nil
+        rooms = [:]
+        roomOrder = []
+        invites = [:]
+    }
+
+    private func stop() async throws {
+        syncStateHandle = nil
+        recoveryStateHandle = nil
+        entriesResult = nil
+        listenerBox = nil
+        await syncService?.stop()
+        syncService = nil
+        roomListService = nil
+        client = nil
+    }
+
+    // MARK: - Room list updates
+
+    private func handleRoomListUpdates(_ updates: [RoomListEntriesUpdate]) {
+        // Build a flat working list from the current sidebar order, apply diffs, then re-publish.
+        var current: [Room] = roomOrder.compactMap { rooms[$0]?.room }
+        for upd in updates {
+            switch upd {
+            case .append(let values):
+                current.append(contentsOf: values)
+            case .clear:
+                current.removeAll()
+            case .pushFront(let value):
+                current.insert(value, at: 0)
+            case .pushBack(let value):
+                current.append(value)
+            case .popFront:
+                if !current.isEmpty { current.removeFirst() }
+            case .popBack:
+                if !current.isEmpty { current.removeLast() }
+            case .insert(let index, let value):
+                let i = min(Int(index), current.count)
+                current.insert(value, at: i)
+            case .set(let index, let value):
+                let i = Int(index)
+                if i < current.count { current[i] = value }
+                else { current.append(value) }
+            case .remove(let index):
+                let i = Int(index)
+                if i < current.count { current.remove(at: i) }
+            case .truncate(let length):
+                if current.count > Int(length) {
+                    current.removeLast(current.count - Int(length))
+                }
+            case .reset(let values):
+                current = values
+            }
+        }
+
+        var newOrder: [String] = []
+        var newRooms: [String: RoomVM] = [:]
+        var newInvites: [String: RoomVM] = [:]
+        for room in current {
+            let id = room.id()
+            let vm = rooms[id] ?? invites[id] ?? RoomVM(room: room, session: self)
+            vm.update(room: room)
+            switch room.membership() {
+            case .invited:
+                newInvites[id] = vm
+            default:
+                newRooms[id] = vm
+                newOrder.append(id)
+            }
+        }
+        // Detach timelines for rooms that are gone.
+        for (id, vm) in rooms where newRooms[id] == nil && newInvites[id] == nil {
+            vm.detach()
+        }
+        rooms = newRooms
+        roomOrder = newOrder
+        invites = newInvites
+    }
+
+    // MARK: - Top-level actions
+
+    func createRoom(name: String?, topic: String?, isDirect: Bool, invite: [String], encrypted: Bool) async -> String? {
+        do {
+            let params = CreateRoomParameters(
+                name: name,
+                topic: topic,
+                isEncrypted: encrypted,
+                isDirect: isDirect,
+                visibility: .private,
+                preset: isDirect ? .trustedPrivateChat : .privateChat,
+                invite: invite.isEmpty ? nil : invite,
+                avatar: nil,
+                powerLevelContentOverride: nil,
+                joinRuleOverride: nil,
+                historyVisibilityOverride: nil,
+                canonicalAlias: nil,
+                isSpace: false
+            )
+            return try await client?.createRoom(request: params)
+        } catch {
+            lastError = describe(error)
             return nil
         }
     }
 
-    func joinByAlias(_ alias: String) async {
-        do { _ = try await api.joinRoom(alias) }
-        catch { lastError = "\(error)" }
-    }
-
-    func sendReadReceipt(roomId: String) async {
-        guard let last = rooms[roomId]?.timeline.last else { return }
-        try? await api.sendReadReceipt(roomId: roomId, eventId: last.eventId)
-    }
-
-    /// Load a page of older messages from /messages and prepend to the timeline.
-    func paginate(roomId: String) async {
-        guard let room = rooms[roomId],
-              !room.paginating,
-              let from = room.prevBatch else { return }
-        room.paginating = true
-        defer { room.paginating = false }
+    func joinByAliasOrId(_ identifier: String) async {
         do {
-            let (events, state, end) = try await api.fetchMessages(roomId: roomId, from: from, dir: "b", limit: 50)
-            // /messages with dir=b returns newest-first; reverse for chronological order.
-            let older = events.reversed()
-            // Older state events should fill in members we didn't know about.
-            for ev in state { room.applyState(ev) }
-            // Apply each older event, but prepend (not append) to the timeline.
-            var prepended: [MatrixEvent] = []
-            for ev in older {
-                switch ev.type {
-                case "m.reaction":
-                    if let target = ev.reactionTargetEventId, let key = ev.reactionKey {
-                        var list = room.reactionsByTarget[target] ?? []
-                        if !list.contains(where: { $0.eventId == ev.eventId }) {
-                            list.append(Room.Reaction(eventId: ev.eventId, key: key, sender: ev.sender))
-                            room.reactionsByTarget[target] = list
-                        }
-                    }
-                    prepended.append(ev)
-                case "m.room.redaction":
-                    if let target = ev.content["redacts"]?.stringValue ?? ev.raw["redacts"]?.stringValue {
-                        room.redactedEventIds.insert(target)
-                    }
-                    prepended.append(ev)
-                default:
-                    if ev.isState { room.applyState(ev) }
-                    prepended.append(ev)
-                }
-            }
-            room.timeline = prepended + room.timeline
-            room.prevBatch = end
+            _ = try await client?.joinRoomByIdOrAlias(roomIdOrAlias: identifier, serverNames: [])
         } catch {
-            lastError = "\(error)"
+            lastError = describe(error)
         }
     }
 
-    /// Send a typing notification, debounced via a per-room task that keeps the server
-    /// status alive while the user is composing.
-    private var typingTasks: [String: Task<Void, Never>] = [:]
+    func acceptInvite(_ roomId: String) async {
+        do {
+            _ = try await client?.joinRoomById(roomId: roomId)
+        } catch { lastError = describe(error) }
+    }
 
-    func notifyTyping(roomId: String, typing: Bool) {
-        guard let me = currentUserId else { return }
-        typingTasks[roomId]?.cancel()
-        typingTasks[roomId] = Task { [api] in
-            try? await api.setTyping(roomId: roomId, userId: me, typing: typing)
-        }
+    func rejectInvite(_ roomId: String) async {
+        do {
+            try await invites[roomId]?.room.leave()
+        } catch { lastError = describe(error) }
+    }
+
+    // MARK: - Encryption / recovery
+
+    /// Use the user's recovery key (or passphrase derived recovery key) to restore identity
+    /// + key backup, then the SDK will decrypt past messages as keys arrive.
+    func recover(withKey key: String) async {
+        guard let enc = client?.encryption() else { return }
+        do { try await enc.recover(recoveryKey: key) }
+        catch { lastError = describe(error) }
     }
 
     // MARK: - Helpers
 
-    /// Convert a JSONValue dictionary back to a plain `[String: Any]` so it can be re-sent.
-    private func jsonObject(_ obj: [String: JSONValue]) -> [String: Any] {
-        var out: [String: Any] = [:]
-        for (k, v) in obj { out[k] = jsonAny(v) }
-        return out
+    private func sessionPaths() throws -> (data: String, cache: String) {
+        let fm = FileManager.default
+        let support = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let base = support.appendingPathComponent("MatrixClient/sdk", isDirectory: true)
+        let data = base.appendingPathComponent("data", isDirectory: true)
+        let cache = base.appendingPathComponent("cache", isDirectory: true)
+        try fm.createDirectory(at: data, withIntermediateDirectories: true)
+        try fm.createDirectory(at: cache, withIntermediateDirectories: true)
+        return (data.path, cache.path)
     }
 
-    private func jsonAny(_ v: JSONValue) -> Any {
-        switch v {
-        case .null: return NSNull()
-        case .bool(let b): return b
-        case .int(let i): return i
-        case .double(let d): return d
-        case .string(let s): return s
-        case .array(let a): return a.map { jsonAny($0) }
-        case .object(let o): return jsonObject(o)
+    /// Best-effort homeserver discovery for the access-token flow.
+    private func resolveHomeserver(input: String) async throws -> URL {
+        var s = input.trimmingCharacters(in: .whitespaces)
+        if s.isEmpty { throw SimpleError("empty homeserver") }
+        if !s.contains("://") { s = "https://" + s }
+        guard let url = URL(string: s) else { throw SimpleError("bad homeserver URL") }
+        // Try .well-known
+        if let wk = URL(string: "/.well-known/matrix/client", relativeTo: url),
+           let (data, resp) = try? await URLSession.shared.data(from: wk),
+           let http = resp as? HTTPURLResponse, http.statusCode == 200,
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let hs = obj["m.homeserver"] as? [String: Any] ?? obj["homeserver"] as? [String: Any],
+           let base = hs["base_url"] as? String, let resolved = URL(string: base) {
+            return resolved
         }
+        return url
     }
+
+    private struct Whoami { let userId: String; let deviceId: String? }
+    private func whoami(homeserver: URL, token: String) async throws -> Whoami {
+        let url = homeserver.appendingPathComponent("/_matrix/client/v3/account/whoami")
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SimpleError("whoami failed (\((resp as? HTTPURLResponse)?.statusCode ?? -1))")
+        }
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let userId = obj["user_id"] as? String else {
+            throw SimpleError("whoami returned unexpected payload")
+        }
+        return Whoami(userId: userId, deviceId: obj["device_id"] as? String)
+    }
+}
+
+// MARK: - Listener boxes (the SDK passes them across the FFI boundary, must be classes)
+
+final class SyncStateObserver: SyncServiceStateObserver, @unchecked Sendable {
+    let cb: @Sendable (SyncServiceState) -> Void
+    init(_ cb: @escaping @Sendable (SyncServiceState) -> Void) { self.cb = cb }
+    func onUpdate(state: SyncServiceState) { cb(state) }
+}
+
+final class RecoveryStateObserver: RecoveryStateListener, @unchecked Sendable {
+    let cb: @Sendable (RecoveryState) -> Void
+    init(_ cb: @escaping @Sendable (RecoveryState) -> Void) { self.cb = cb }
+    func onUpdate(status: RecoveryState) { cb(status) }
+}
+
+final class RoomListListener: RoomListEntriesListener, @unchecked Sendable {
+    let cb: @Sendable ([RoomListEntriesUpdate]) -> Void
+    init(_ cb: @escaping @Sendable ([RoomListEntriesUpdate]) -> Void) { self.cb = cb }
+    func onUpdate(roomEntriesUpdate: [RoomListEntriesUpdate]) { cb(roomEntriesUpdate) }
+}
+
+// MARK: - Tiny error type for our own paths
+struct SimpleError: LocalizedError {
+    let message: String
+    init(_ m: String) { self.message = m }
+    var errorDescription: String? { message }
+}
+
+/// Best-effort error → string. The SDK throws `ClientError`/`RoomError` enums which all conform
+/// to `LocalizedError` but their associated values often carry better detail in `description`.
+func describe(_ error: Error) -> String {
+    if let le = error as? LocalizedError, let d = le.errorDescription { return d }
+    return String(describing: error)
 }

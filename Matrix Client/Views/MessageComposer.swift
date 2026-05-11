@@ -1,34 +1,29 @@
 import SwiftUI
+import MatrixRustSDK
 
 struct MessageComposer: View {
     @Binding var text: String
-    @Binding var replyingTo: MatrixEvent?
-    let isEncrypted: Bool
-    @ObservedObject var room: Room
+    @Binding var replyingToId: String?
+    @ObservedObject var room: RoomVM
     let onSend: () -> Void
     let onEmoji: () -> Void
 
-    @EnvironmentObject private var session: MatrixSession
     @FocusState private var focused: Bool
     @State private var lastTypingSent: Date?
     @State private var stopTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 4) {
-            if let replyingTo {
+            if let replyingToId {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "arrow.turn.up.left")
                         .foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("Replying to \(room.memberDisplayName(replyingTo.sender) ?? replyingTo.sender)")
-                            .font(.caption.bold())
-                        Text(replyingTo.messageBody ?? "(\(replyingTo.type))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                        Text("Replying to message").font(.caption.bold())
+                        Text(replyingToId).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer()
-                    Button { self.replyingTo = nil } label: {
+                    Button { self.replyingToId = nil } label: {
                         Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                     }.buttonStyle(.plain)
                 }
@@ -41,16 +36,13 @@ struct MessageComposer: View {
 
             HStack(alignment: .bottom, spacing: 8) {
                 Button(action: onEmoji) {
-                    Image(systemName: "face.smiling")
-                        .font(.title3)
+                    Image(systemName: "face.smiling").font(.title3)
                 }
                 .buttonStyle(.plain)
                 .help("Insert emoji")
 
                 TextField(
-                    isEncrypted
-                        ? "🔒 Send a message (encrypted — body will be sent unencrypted by this client)"
-                        : "Send a message…",
+                    room.isEncrypted ? "🔒 Send an encrypted message…" : "Send a message…",
                     text: $text,
                     axis: .vertical
                 )
@@ -65,8 +57,7 @@ struct MessageComposer: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
                 Button(action: onSend) {
-                    Image(systemName: "paperplane.fill")
-                        .font(.title3)
+                    Image(systemName: "paperplane.fill").font(.title3)
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -78,29 +69,27 @@ struct MessageComposer: View {
         .onAppear { focused = true }
         .onDisappear {
             stopTask?.cancel()
-            session.notifyTyping(roomId: room.id, typing: false)
+            Task { await room.setTyping(false) }
         }
     }
 
-    /// Refresh typing every ~10s while the user is composing, and clear it after a brief
-    /// idle window so the indicator goes away once they stop.
     private func handleTextChange(_ newValue: String) {
         let now = Date()
         if newValue.isEmpty {
             stopTask?.cancel()
-            session.notifyTyping(roomId: room.id, typing: false)
+            Task { await room.setTyping(false) }
             lastTypingSent = nil
             return
         }
         if lastTypingSent == nil || now.timeIntervalSince(lastTypingSent!) > 10 {
-            session.notifyTyping(roomId: room.id, typing: true)
+            Task { await room.setTyping(true) }
             lastTypingSent = now
         }
         stopTask?.cancel()
-        stopTask = Task { [roomId = room.id] in
+        stopTask = Task { [room] in
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             if !Task.isCancelled {
-                session.notifyTyping(roomId: roomId, typing: false)
+                await room.setTyping(false)
                 await MainActor.run { lastTypingSent = nil }
             }
         }

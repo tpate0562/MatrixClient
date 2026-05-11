@@ -33,7 +33,7 @@ struct CreateRoomView: View {
                     .textFieldStyle(.roundedBorder)
             }
             Toggle("End-to-end encrypted", isOn: $encrypted)
-                .help("Enabling encryption is permanent. Note: this client can't decrypt encrypted messages.")
+                .help("Enabling encryption is permanent.")
             if let error {
                 Text(error).font(.caption).foregroundStyle(.red)
             }

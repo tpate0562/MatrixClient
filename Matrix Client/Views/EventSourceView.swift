@@ -1,7 +1,9 @@
 import SwiftUI
+import AppKit
+import MatrixRustSDK
 
 struct EventSourceView: View {
-    let event: MatrixEvent
+    let item: TimelineItem
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -9,13 +11,13 @@ struct EventSourceView: View {
             HStack {
                 VStack(alignment: .leading) {
                     Text("Event Source").font(.headline)
-                    Text(event.eventId).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Text(item.uniqueId().id).font(.caption.monospaced()).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Copy") {
                     let pb = NSPasteboard.general
                     pb.clearContents()
-                    pb.setString(event.raw.prettyPrinted, forType: .string)
+                    pb.setString(item.fmtDebug(), forType: .string)
                 }
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
@@ -23,7 +25,7 @@ struct EventSourceView: View {
             .padding()
             Divider()
             ScrollView {
-                Text(event.raw.prettyPrinted)
+                Text(item.fmtDebug())
                     .font(.system(.callout, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)

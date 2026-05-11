@@ -1,11 +1,14 @@
 import SwiftUI
+import MatrixRustSDK
 
 struct MainView: View {
     @EnvironmentObject private var session: MatrixSession
     @State private var selectedRoomId: String?
     @State private var showCreateRoom = false
+    @State private var roomCreationMode: CreateRoomView.Mode = .room
     @State private var showJoinRoom = false
     @State private var joinAlias: String = ""
+    @State private var showRecovery = false
 
     var body: some View {
         NavigationSplitView {
@@ -15,15 +18,19 @@ struct MainView: View {
                     ToolbarItem(placement: .primaryAction) {
                         Menu {
                             Button("New Direct Message") {
-                                showCreateRoom = true
                                 roomCreationMode = .dm
+                                showCreateRoom = true
                             }
                             Button("New Room") {
-                                showCreateRoom = true
                                 roomCreationMode = .room
+                                showCreateRoom = true
                             }
                             Divider()
                             Button("Join Room by ID/Alias…") { showJoinRoom = true }
+                            Divider()
+                            if session.recoveryState != .enabled {
+                                Button("Recover Encryption Keys…") { showRecovery = true }
+                            }
                         } label: {
                             Label("New", systemImage: "square.and.pencil")
                         }
@@ -38,8 +45,8 @@ struct MainView: View {
                     }
                 }
         } detail: {
-            if let id = selectedRoomId, let room = session.rooms[id] {
-                RoomDetailView(room: room)
+            if let id = selectedRoomId, let vm = session.rooms[id] {
+                RoomDetailView(room: vm)
                     .id(id)
             } else {
                 EmptyDetailView()
@@ -55,14 +62,15 @@ struct MainView: View {
                 showJoinRoom = false
                 let alias = joinAlias
                 joinAlias = ""
-                Task { await session.joinByAlias(alias) }
+                Task { await session.joinByAliasOrId(alias) }
             } cancel: {
                 showJoinRoom = false
             }
         }
+        .sheet(isPresented: $showRecovery) {
+            RecoverySheet()
+        }
     }
-
-    @State private var roomCreationMode: CreateRoomView.Mode = .room
 }
 
 private struct EmptyDetailView: View {
@@ -76,17 +84,38 @@ private struct EmptyDetailView: View {
             Text("Select a room")
                 .font(.title2)
                 .foregroundStyle(.secondary)
-            if session.syncing {
-                HStack {
-                    ProgressView().controlSize(.small)
-                    Text("Syncing…").foregroundStyle(.tertiary)
-                }
+            HStack(spacing: 6) {
+                stateDot
+                Text(stateLabel).foregroundStyle(.tertiary)
             }
             if let me = session.currentUserId {
                 Text(me).font(.caption).foregroundStyle(.tertiary)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var stateDot: some View {
+        let c: Color = {
+            switch session.syncState {
+            case .running: return .green
+            case .idle, .terminated: return .yellow
+            case .error: return .red
+            case .offline: return .gray
+            }
+        }()
+        Circle().fill(c).frame(width: 8, height: 8)
+    }
+
+    private var stateLabel: String {
+        switch session.syncState {
+        case .running: return "Syncing"
+        case .idle: return "Idle"
+        case .terminated: return "Sync stopped"
+        case .error: return "Sync error"
+        case .offline: return "Offline"
+        }
     }
 }
 

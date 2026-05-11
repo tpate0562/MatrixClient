@@ -1,14 +1,39 @@
 import Foundation
 import Security
+import MatrixRustSDK
 
-/// Persists credentials in the macOS keychain. Single slot — we only track one logged-in
-/// user at a time.
+/// Persists the SDK `Session` in the macOS keychain. The Session is a value type so we
+/// serialize it via a side struct (SDK Session isn't Codable).
 enum KeychainStore {
-    private static let service = "tejaspatel.Matrix-Client.credentials"
+    private static let service = "tejaspatel.Matrix-Client.session"
     private static let account = "current"
 
-    static func save(_ creds: Credentials) {
-        guard let data = try? JSONEncoder().encode(creds) else { return }
+    struct StoredSession: Codable {
+        let accessToken: String
+        let refreshToken: String?
+        let userId: String
+        let deviceId: String
+        let homeserverUrl: String
+        let oidcData: String?
+        let slidingSync: String   // "native" | "none"
+    }
+
+    static func save(_ session: Session) {
+        let stored = StoredSession(
+            accessToken: session.accessToken,
+            refreshToken: session.refreshToken,
+            userId: session.userId,
+            deviceId: session.deviceId,
+            homeserverUrl: session.homeserverUrl,
+            oidcData: session.oidcData,
+            slidingSync: {
+                switch session.slidingSyncVersion {
+                case .none: return "none"
+                case .native: return "native"
+                }
+            }()
+        )
+        guard let data = try? JSONEncoder().encode(stored) else { return }
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -20,7 +45,7 @@ enum KeychainStore {
         SecItemAdd(add as CFDictionary, nil)
     }
 
-    static func load() -> Credentials? {
+    static func load() -> Session? {
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -30,8 +55,19 @@ enum KeychainStore {
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(q as CFDictionary, &item)
-        guard status == errSecSuccess, let data = item as? Data else { return nil }
-        return try? JSONDecoder().decode(Credentials.self, from: data)
+        guard status == errSecSuccess, let data = item as? Data,
+              let stored = try? JSONDecoder().decode(StoredSession.self, from: data) else {
+            return nil
+        }
+        return Session(
+            accessToken: stored.accessToken,
+            refreshToken: stored.refreshToken,
+            userId: stored.userId,
+            deviceId: stored.deviceId,
+            homeserverUrl: stored.homeserverUrl,
+            oidcData: stored.oidcData,
+            slidingSyncVersion: stored.slidingSync == "native" ? .native : .none
+        )
     }
 
     static func clear() {

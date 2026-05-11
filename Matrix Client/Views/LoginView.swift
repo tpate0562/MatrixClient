@@ -58,7 +58,7 @@ struct LoginView: View {
                 .font(.caption)
                 .foregroundStyle(.blue)
 
-            Text("Encryption is detected but not yet decoded — encrypted messages show as 🔒 placeholders.")
+            Text("End-to-end encryption is provided by the Matrix Rust SDK. Use Settings → Recover to restore your key backup so old messages decrypt.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)

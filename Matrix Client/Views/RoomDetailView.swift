@@ -1,14 +1,16 @@
 import SwiftUI
+import MatrixRustSDK
 
 struct RoomDetailView: View {
-    @ObservedObject var room: Room
+    @ObservedObject var room: RoomVM
     @EnvironmentObject private var session: MatrixSession
     @State private var draft: String = ""
     @State private var showAdmin = false
     @State private var showPins = false
-    @State private var sourceEvent: MatrixEvent?
-    @State private var emojiTargetEvent: MatrixEvent?
-    @State private var replyingTo: MatrixEvent?
+    @State private var sourceItem: TimelineItem?
+    @State private var emojiTargetEventId: String?
+    @State private var showEmojiForCompose = false
+    @State private var replyingToId: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -38,23 +40,36 @@ struct RoomDetailView: View {
         .sheet(isPresented: $showPins) {
             PinnedEventsView(room: room)
         }
-        .sheet(item: $sourceEvent) { ev in
-            EventSourceView(event: ev)
+        .sheet(item: Binding(
+            get: { sourceItem.map { SourceWrapper(item: $0) } },
+            set: { sourceItem = $0?.item }
+        )) { wrapper in
+            EventSourceView(item: wrapper.item)
         }
-        .sheet(item: $emojiTargetEvent) { ev in
+        .sheet(item: Binding(
+            get: { emojiTargetEventId.map { EmojiTarget(eventId: $0) } },
+            set: { emojiTargetEventId = $0?.eventId }
+        )) { target in
             EmojiPickerView { key in
-                emojiTargetEvent = nil
-                Task { await session.toggleReaction(roomId: room.id, targetEventId: ev.eventId, key: key) }
+                emojiTargetEventId = nil
+                Task { await room.toggleReaction(targetEventId: target.eventId, key: key) }
             }
         }
-        .onAppear {
-            Task { await session.sendReadReceipt(roomId: room.id) }
+        .sheet(isPresented: $showEmojiForCompose) {
+            EmojiPickerView { key in
+                showEmojiForCompose = false
+                draft += key
+            }
+        }
+        .task(id: room.id) {
+            await room.openTimeline()
+            await room.markAsRead()
         }
     }
 
     private var header: some View {
         HStack(spacing: 10) {
-            Avatar(name: room.displayName, mxc: room.avatarMxc, size: 32)
+            Avatar(name: room.displayName, mxc: room.avatarUrl, size: 32)
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     Text(room.displayName).font(.headline)
@@ -73,58 +88,36 @@ struct RoomDetailView: View {
                 }
             }
             Spacer()
-            Text("\(room.joinedMemberCount) members")
+            Text("\(room.joinedMembersCount) members")
                 .font(.caption).foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
     private var timeline: some View {
-        let items = visibleItems()
-        return ScrollViewReader { proxy in
+        ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     paginationHeader
-                    ForEach(items.indices, id: \.self) { idx in
-                        let item = items[idx]
-                        switch item {
-                        case .dayHeader(let label):
-                            HStack {
-                                Spacer()
-                                Text(label)
-                                    .font(.caption.bold())
-                                    .padding(.horizontal, 10).padding(.vertical, 3)
-                                    .background(Color.secondary.opacity(0.15))
-                                    .clipShape(Capsule())
-                                Spacer()
-                            }
-                            .padding(.vertical, 6)
-                        case .event(let ev, let grouped):
-                            MessageRow(
-                                event: ev,
-                                room: room,
-                                groupedWithPrevious: grouped,
-                                onReact: { emojiTargetEvent = ev },
-                                onQuickReact: { key in
-                                    Task { await session.toggleReaction(roomId: room.id, targetEventId: ev.eventId, key: key) }
-                                },
-                                onReply: { replyingTo = ev },
-                                onRedact: {
-                                    Task { await session.redact(roomId: room.id, eventId: ev.eventId) }
-                                },
-                                onPin: {
-                                    Task { await session.togglePin(roomId: room.id, eventId: ev.eventId) }
-                                },
-                                onShowSource: { sourceEvent = ev }
-                            )
-                            .id(ev.eventId)
-                        }
+                    ForEach(room.items.indices, id: \.self) { idx in
+                        let item = room.items[idx]
+                        TimelineRow(
+                            item: item,
+                            room: room,
+                            onReact: { id in emojiTargetEventId = id },
+                            onQuickReact: { id, key in Task { await room.toggleReaction(targetEventId: id, key: key) } },
+                            onReply: { id in replyingToId = id },
+                            onRedact: { id in Task { await room.redact(eventId: id) } },
+                            onTogglePin: { id in Task { await room.togglePin(eventId: id) } },
+                            onShowSource: { sourceItem = item }
+                        )
+                        .id(item.uniqueId().id)
                     }
                     Color.clear.frame(height: 1).id("__bottom__")
                 }
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
-            .onChange(of: room.timeline.count) {
+            .onChange(of: room.items.count) {
                 withAnimation { proxy.scrollTo("__bottom__", anchor: .bottom) }
             }
             .onAppear {
@@ -138,18 +131,11 @@ struct RoomDetailView: View {
             typingIndicator
             MessageComposer(
                 text: $draft,
-                replyingTo: $replyingTo,
-                isEncrypted: room.isEncrypted,
+                replyingToId: $replyingToId,
                 room: room,
                 onSend: send,
-                onEmoji: { emojiTargetEvent = nil; showEmojiForCompose = true }
+                onEmoji: { showEmojiForCompose = true }
             )
-        }
-        .sheet(isPresented: $showEmojiForCompose) {
-            EmojiPickerView { key in
-                showEmojiForCompose = false
-                draft += key
-            }
         }
     }
 
@@ -169,7 +155,7 @@ struct RoomDetailView: View {
     }
 
     private var typingText: String {
-        let names = room.typingUserIds.map { room.memberDisplayName($0) ?? $0 }.sorted()
+        let names = room.typingUserIds.map { room.members[$0]?.displayName ?? $0 }.sorted()
         switch names.count {
         case 0: return ""
         case 1: return "\(names[0]) is typing…"
@@ -180,7 +166,7 @@ struct RoomDetailView: View {
 
     @ViewBuilder
     private var paginationHeader: some View {
-        if room.prevBatch != nil {
+        if room.canPaginate {
             HStack {
                 Spacer()
                 if room.paginating {
@@ -189,7 +175,7 @@ struct RoomDetailView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     Button("Load older messages") {
-                        Task { await session.paginate(roomId: room.id) }
+                        Task { await room.paginate() }
                     }
                     .buttonStyle(.borderless)
                     .font(.caption)
@@ -200,56 +186,30 @@ struct RoomDetailView: View {
         }
     }
 
-    @State private var showEmojiForCompose = false
-
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
+        let replyTo = replyingToId
+        replyingToId = nil
         Task {
-            await session.sendMessage(text, in: room.id)
-            await session.sendReadReceipt(roomId: room.id)
-        }
-        replyingTo = nil
-    }
-
-    // Render plan with date dividers + grouping flags.
-    private enum Item { case dayHeader(String); case event(MatrixEvent, grouped: Bool) }
-
-    private func visibleItems() -> [Item] {
-        var items: [Item] = []
-        var lastDay: String?
-        var lastSender: String?
-        var lastTs: Int64 = 0
-        let df = DateFormatter()
-        df.dateStyle = .medium
-        df.doesRelativeDateFormatting = true
-        for ev in room.timeline where !room.redactedEventIds.contains(ev.eventId) {
-            // Drop reactions; they're rendered under their target.
-            if ev.type == "m.reaction" { continue }
-            // Drop redaction events as their own row.
-            if ev.type == "m.room.redaction" { continue }
-            // Drop message edits (we'll fold the replacement in below).
-            if ev.type == "m.room.message", ev.isEdit { continue }
-
-            let day = df.string(from: ev.timestamp)
-            if day != lastDay {
-                items.append(.dayHeader(day))
-                lastDay = day
-                lastSender = nil
+            if let replyTo {
+                await room.sendReply(to: replyTo, text: text)
+            } else {
+                await room.send(text)
             }
-            let grouped = ev.sender == lastSender && (ev.originServerTs - lastTs) < 5 * 60 * 1000
-            items.append(.event(ev, grouped: grouped))
-            lastSender = ev.sender
-            lastTs = ev.originServerTs
+            await room.markAsRead()
         }
-        return items
     }
+}
+
+private struct EmojiTarget: Identifiable {
+    let eventId: String
+    var id: String { eventId }
 }
 
 private struct TypingDots: View {
     @State private var phase: Int = 0
-
     var body: some View {
         HStack(spacing: 2) {
             ForEach(0..<3, id: \.self) { i in
@@ -265,4 +225,9 @@ private struct TypingDots: View {
             }
         }
     }
+}
+
+private struct SourceWrapper: Identifiable {
+    let item: TimelineItem
+    var id: String { item.uniqueId().id }
 }

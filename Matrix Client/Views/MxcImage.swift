@@ -1,6 +1,7 @@
 import SwiftUI
+import MatrixRustSDK
 
-/// Loads an `mxc://` URI as an authenticated thumbnail and renders it.
+/// Loads an `mxc://` URI as a thumbnail through the SDK and renders it.
 struct MxcImage: View {
     let mxc: String?
     var maxWidth: CGFloat = 360
@@ -42,23 +43,25 @@ struct MxcImage: View {
 
     private func load() async {
         image = nil; failed = false
-        guard let mxc, let creds = session.credentials else { return }
-        let api = session.api
-        // Request a generous thumbnail; the server resizes for us.
-        guard let url = await api.thumbnailURL(homeserver: creds.homeserverURL, mxc: mxc, size: Int(max(maxWidth, maxHeight) * 2)) else {
-            failed = true; return
-        }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
+        guard let mxc, let client = session.client, mxc.hasPrefix("mxc://") else { failed = true; return }
         do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            if let nsImage = NSImage(data: data) {
-                self.image = nsImage
+            let source = try MediaSource.fromUrl(url: mxc)
+            let data = try await client.getMediaThumbnail(
+                mediaSource: source,
+                width: UInt64(maxWidth * 2),
+                height: UInt64(maxHeight * 2)
+            )
+            if let nsImage = NSImage(data: data) { self.image = nsImage }
+            else { self.failed = true }
+        } catch {
+            // Some servers don't support thumbnails for all content; try full.
+            if let source = try? MediaSource.fromUrl(url: mxc),
+               let data = try? await client.getMediaContent(mediaSource: source),
+               let img = NSImage(data: data) {
+                self.image = img
             } else {
                 self.failed = true
             }
-        } catch {
-            self.failed = true
         }
     }
 }
