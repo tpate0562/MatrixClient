@@ -8,11 +8,13 @@ struct SyncResponse: Sendable {
     let invite: [String: InvitedRoom]
     let leave: [String: LeftRoom]
     let accountData: [MatrixEvent]
+    let toDevice: [MatrixEvent]   // for future E2EE: m.room_key, m.room_key_request, etc.
 
     struct JoinedRoom: Sendable {
         let timeline: [MatrixEvent]
         let state: [MatrixEvent]
         let accountData: [MatrixEvent]
+        let ephemeral: [MatrixEvent]
         let unreadCount: Int
         let highlightCount: Int
         let heroes: [String]
@@ -43,6 +45,8 @@ struct SyncResponse: Sendable {
                 .compactMap { MatrixEvent.decode(roomId: roomId, value: $0) }
             let accountData = (val["account_data"]?["events"]?.arrayValue ?? [])
                 .compactMap { MatrixEvent.decode(roomId: roomId, value: $0) }
+            let ephemeral = (val["ephemeral"]?["events"]?.arrayValue ?? [])
+                .compactMap { MatrixEvent.decode(roomId: roomId, value: $0) }
             let summary = val["summary"]
             let heroes = summary?["m.heroes"]?.arrayValue?.compactMap { $0.stringValue } ?? []
             let joinedCount = summary?["m.joined_member_count"]?.intValue.map(Int.init) ?? 0
@@ -53,6 +57,7 @@ struct SyncResponse: Sendable {
             let limited = val["timeline"]?["limited"]?.boolValue ?? false
             join[roomId] = JoinedRoom(
                 timeline: timeline, state: state, accountData: accountData,
+                ephemeral: ephemeral,
                 unreadCount: unread, highlightCount: highlight,
                 heroes: heroes,
                 joinedMemberCount: joinedCount, invitedMemberCount: invitedCount,
@@ -80,11 +85,14 @@ struct SyncResponse: Sendable {
 
         let accountData = (json["account_data"]?["events"]?.arrayValue ?? [])
             .compactMap { MatrixEvent.decode(roomId: nil, value: $0) }
+        let toDevice = (json["to_device"]?["events"]?.arrayValue ?? [])
+            .compactMap { MatrixEvent.decode(roomId: nil, value: $0) }
 
         return SyncResponse(
             nextBatch: nextBatch,
             join: join, invite: invite, leave: leave,
-            accountData: accountData
+            accountData: accountData,
+            toDevice: toDevice
         )
     }
 }

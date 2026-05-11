@@ -152,11 +152,25 @@ final class MatrixSession: ObservableObject {
             // State first, then timeline.
             for ev in jr.state { room.applyState(ev) }
             for ev in jr.timeline { room.applyTimeline(ev) }
+            // Ephemeral (typing, receipts).
+            for ev in jr.ephemeral where ev.type == "m.typing" {
+                let ids = ev.content["user_ids"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+                var set = Set(ids)
+                if let me = currentUserId { set.remove(me) }
+                room.typingUserIds = set
+            }
             // Trim timeline to a sane size to keep memory bounded.
             if room.timeline.count > 500 {
                 room.timeline = Array(room.timeline.suffix(500))
             }
             if !jr.timeline.isEmpty { touched.append(roomId) }
+        }
+
+        // Stash to-device events; the future crypto layer will consume them.
+        if !resp.toDevice.isEmpty {
+            #if DEBUG
+            print("[sync] received \(resp.toDevice.count) to-device events (types: \(Set(resp.toDevice.map(\.type))))")
+            #endif
         }
 
         // Invites.
@@ -309,6 +323,61 @@ final class MatrixSession: ObservableObject {
     func sendReadReceipt(roomId: String) async {
         guard let last = rooms[roomId]?.timeline.last else { return }
         try? await api.sendReadReceipt(roomId: roomId, eventId: last.eventId)
+    }
+
+    /// Load a page of older messages from /messages and prepend to the timeline.
+    func paginate(roomId: String) async {
+        guard let room = rooms[roomId],
+              !room.paginating,
+              let from = room.prevBatch else { return }
+        room.paginating = true
+        defer { room.paginating = false }
+        do {
+            let (events, state, end) = try await api.fetchMessages(roomId: roomId, from: from, dir: "b", limit: 50)
+            // /messages with dir=b returns newest-first; reverse for chronological order.
+            let older = events.reversed()
+            // Older state events should fill in members we didn't know about.
+            for ev in state { room.applyState(ev) }
+            // Apply each older event, but prepend (not append) to the timeline.
+            var prepended: [MatrixEvent] = []
+            for ev in older {
+                switch ev.type {
+                case "m.reaction":
+                    if let target = ev.reactionTargetEventId, let key = ev.reactionKey {
+                        var list = room.reactionsByTarget[target] ?? []
+                        if !list.contains(where: { $0.eventId == ev.eventId }) {
+                            list.append(Room.Reaction(eventId: ev.eventId, key: key, sender: ev.sender))
+                            room.reactionsByTarget[target] = list
+                        }
+                    }
+                    prepended.append(ev)
+                case "m.room.redaction":
+                    if let target = ev.content["redacts"]?.stringValue ?? ev.raw["redacts"]?.stringValue {
+                        room.redactedEventIds.insert(target)
+                    }
+                    prepended.append(ev)
+                default:
+                    if ev.isState { room.applyState(ev) }
+                    prepended.append(ev)
+                }
+            }
+            room.timeline = prepended + room.timeline
+            room.prevBatch = end
+        } catch {
+            lastError = "\(error)"
+        }
+    }
+
+    /// Send a typing notification, debounced via a per-room task that keeps the server
+    /// status alive while the user is composing.
+    private var typingTasks: [String: Task<Void, Never>] = [:]
+
+    func notifyTyping(roomId: String, typing: Bool) {
+        guard let me = currentUserId else { return }
+        typingTasks[roomId]?.cancel()
+        typingTasks[roomId] = Task { [api] in
+            try? await api.setTyping(roomId: roomId, userId: me, typing: typing)
+        }
     }
 
     // MARK: - Helpers

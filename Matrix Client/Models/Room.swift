@@ -24,6 +24,8 @@ final class Room: ObservableObject, Identifiable {
     @Published var pinnedEventIds: [String] = []
     @Published var redactedEventIds: Set<String> = []
     @Published var prevBatch: String?
+    @Published var typingUserIds: Set<String> = []
+    @Published var paginating: Bool = false
 
     init(id: String) { self.id = id }
 

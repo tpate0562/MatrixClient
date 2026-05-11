@@ -65,16 +65,7 @@ struct MessageRow: View {
             leftGutter
             VStack(alignment: .leading, spacing: 2) {
                 if !groupedWithPrevious { senderLine }
-                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(effectiveBody ?? "")
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if wasEdited {
-                        Text("(edited)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                messageBodyView
                 reactionsRow
             }
             Spacer()
@@ -86,6 +77,145 @@ struct MessageRow: View {
         )
     }
 
+    @ViewBuilder
+    private var messageBodyView: some View {
+        let mt = event.msgType
+        switch mt {
+        case "m.image":   imageAttachment
+        case "m.video":   videoAttachment
+        case "m.audio":   audioAttachment
+        case "m.file":    fileAttachment
+        case "m.emote":
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text("*")
+                    .foregroundStyle(.tertiary)
+                Text((effectiveBody ?? "").trimmingCharacters(in: .whitespacesAndNewlines))
+                    .italic()
+                    .textSelection(.enabled)
+                if wasEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
+            }
+        case "m.notice":
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(effectiveBody ?? "")
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                if wasEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
+            }
+        default:
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(effectiveBody ?? "")
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                if wasEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
+            }
+        }
+    }
+
+    private var attachmentMxc: String? {
+        // For unencrypted attachments the URL is in content.url; for encrypted attachments it's
+        // in content.file.url (and the payload is symmetrically encrypted — we can't decrypt yet).
+        event.content["url"]?.stringValue ?? event.content["file"]?["url"]?.stringValue
+    }
+
+    private var attachmentIsEncrypted: Bool {
+        event.content["file"]?["url"] != nil
+    }
+
+    private var imageAttachment: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if attachmentIsEncrypted {
+                lockedAttachmentRow("Encrypted image")
+            } else {
+                Button {
+                    openAttachment()
+                } label: {
+                    MxcImage(mxc: attachmentMxc, maxWidth: 360, maxHeight: 240)
+                }
+                .buttonStyle(.plain)
+                .help(event.messageBody ?? "Image")
+            }
+            if let body = event.messageBody, !body.isEmpty {
+                Text(body).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var videoAttachment: some View {
+        attachmentChip(systemName: "play.rectangle.fill", label: event.messageBody ?? "Video")
+    }
+
+    private var audioAttachment: some View {
+        attachmentChip(systemName: "waveform", label: event.messageBody ?? "Audio")
+    }
+
+    private var fileAttachment: some View {
+        attachmentChip(systemName: "doc.fill", label: event.content["filename"]?.stringValue ?? event.messageBody ?? "File")
+    }
+
+    @ViewBuilder
+    private func attachmentChip(systemName: String, label: String) -> some View {
+        if attachmentIsEncrypted {
+            lockedAttachmentRow(label)
+        } else {
+            Button(action: openAttachment) {
+                HStack(spacing: 8) {
+                    Image(systemName: systemName)
+                        .font(.title2)
+                        .foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(label).font(.callout.weight(.medium))
+                        if let size = event.content["info"]?["size"]?.intValue {
+                            Text(formatBytes(size)).font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
+                    Image(systemName: "arrow.down.circle")
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func lockedAttachmentRow(_ label: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "lock.fill").foregroundStyle(.orange)
+            Text("\(label) — encrypted, can't open")
+                .foregroundStyle(.secondary).italic()
+        }
+    }
+
+    private func openAttachment() {
+        guard let mxc = attachmentMxc,
+              let creds = session.credentials else { return }
+        let api = session.api
+        Task {
+            guard let url = await api.mediaURL(homeserver: creds.homeserverURL, mxc: mxc) else { return }
+            var req = URLRequest(url: url)
+            req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
+            do {
+                let (data, response) = try await URLSession.shared.data(for: req)
+                let suggestedName = event.content["filename"]?.stringValue ?? event.messageBody ?? (response.suggestedFilename ?? "download")
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString)
+                    .appendingPathComponent(suggestedName)
+                try FileManager.default.createDirectory(at: tmp.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: tmp)
+                await MainActor.run { NSWorkspace.shared.open(tmp) }
+            } catch {
+                // Silently ignore for now; could surface to lastError.
+            }
+        }
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f.string(fromByteCount: bytes)
+    }
+
     private var encryptedRow: some View {
         HStack(alignment: .top, spacing: 8) {
             leftGutter
@@ -93,9 +223,20 @@ struct MessageRow: View {
                 if !groupedWithPrevious { senderLine }
                 HStack(spacing: 6) {
                     Image(systemName: "lock.fill").foregroundStyle(.orange)
-                    Text("Encrypted message — decryption not supported in this client")
+                    Text("Encrypted message")
                         .foregroundStyle(.secondary)
                         .italic()
+                    if let algo = event.content["algorithm"]?.stringValue {
+                        Text("· \(algoShort(algo))")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                    }
+                    if let sid = event.content["session_id"]?.stringValue {
+                        Text("· session \(sid.prefix(6))")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                            .help("Session ID: \(sid)")
+                    }
                 }
                 reactionsRow
             }
@@ -103,6 +244,14 @@ struct MessageRow: View {
             trailingActions
         }
         .background(hovering ? Color.secondary.opacity(0.05) : Color.clear)
+    }
+
+    private func algoShort(_ s: String) -> String {
+        switch s {
+        case "m.megolm.v1.aes-sha2": return "megolm v1"
+        case "m.olm.v1.curve25519-aes-sha2": return "olm v1"
+        default: return s
+        }
     }
 
     private var memberStateRow: some View {

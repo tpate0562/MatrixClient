@@ -8,7 +8,10 @@ struct MessageComposer: View {
     let onSend: () -> Void
     let onEmoji: () -> Void
 
+    @EnvironmentObject private var session: MatrixSession
     @FocusState private var focused: Bool
+    @State private var lastTypingSent: Date?
+    @State private var stopTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 4) {
@@ -55,6 +58,7 @@ struct MessageComposer: View {
                 .textFieldStyle(.plain)
                 .focused($focused)
                 .onSubmit(onSend)
+                .onChange(of: text) { _, newValue in handleTextChange(newValue) }
                 .padding(.vertical, 6)
                 .padding(.horizontal, 8)
                 .background(Color.secondary.opacity(0.08))
@@ -72,5 +76,33 @@ struct MessageComposer: View {
         }
         .background(.background)
         .onAppear { focused = true }
+        .onDisappear {
+            stopTask?.cancel()
+            session.notifyTyping(roomId: room.id, typing: false)
+        }
+    }
+
+    /// Refresh typing every ~10s while the user is composing, and clear it after a brief
+    /// idle window so the indicator goes away once they stop.
+    private func handleTextChange(_ newValue: String) {
+        let now = Date()
+        if newValue.isEmpty {
+            stopTask?.cancel()
+            session.notifyTyping(roomId: room.id, typing: false)
+            lastTypingSent = nil
+            return
+        }
+        if lastTypingSent == nil || now.timeIntervalSince(lastTypingSent!) > 10 {
+            session.notifyTyping(roomId: room.id, typing: true)
+            lastTypingSent = now
+        }
+        stopTask?.cancel()
+        stopTask = Task { [roomId = room.id] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            if !Task.isCancelled {
+                session.notifyTyping(roomId: roomId, typing: false)
+                await MainActor.run { lastTypingSent = nil }
+            }
+        }
     }
 }

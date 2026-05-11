@@ -244,20 +244,78 @@ actor MatrixAPI {
         return json["displayname"]?.stringValue
     }
 
-    /// Translate an `mxc://` URI to a thumbnail HTTP URL on this server.
+    /// Translate an `mxc://` URI to an authenticated thumbnail HTTP URL (Matrix v1.11+).
     nonisolated func thumbnailURL(homeserver: URL, mxc: String, size: Int = 96) -> URL? {
-        guard mxc.hasPrefix("mxc://") else { return nil }
-        let trimmed = String(mxc.dropFirst("mxc://".count))
-        let parts = trimmed.split(separator: "/", maxSplits: 1)
-        guard parts.count == 2 else { return nil }
+        guard let (server, mediaId) = parseMxc(mxc) else { return nil }
         var c = URLComponents(url: homeserver, resolvingAgainstBaseURL: false)!
-        c.path = "/_matrix/media/v3/thumbnail/\(parts[0])/\(parts[1])"
+        c.path = "/_matrix/client/v1/media/thumbnail/\(server)/\(mediaId)"
         c.queryItems = [
             URLQueryItem(name: "width", value: String(size)),
             URLQueryItem(name: "height", value: String(size)),
-            URLQueryItem(name: "method", value: "crop"),
+            URLQueryItem(name: "method", value: "scale"),
         ]
         return c.url
+    }
+
+    /// Authenticated download URL for the full media payload (Matrix v1.11+).
+    nonisolated func mediaURL(homeserver: URL, mxc: String) -> URL? {
+        guard let (server, mediaId) = parseMxc(mxc) else { return nil }
+        var c = URLComponents(url: homeserver, resolvingAgainstBaseURL: false)!
+        c.path = "/_matrix/client/v1/media/download/\(server)/\(mediaId)"
+        return c.url
+    }
+
+    nonisolated private func parseMxc(_ mxc: String) -> (server: String, id: String)? {
+        guard mxc.hasPrefix("mxc://") else { return nil }
+        let parts = mxc.dropFirst("mxc://".count).split(separator: "/", maxSplits: 1)
+        guard parts.count == 2 else { return nil }
+        return (String(parts[0]), String(parts[1]))
+    }
+
+    // MARK: - Backfill
+
+    /// Fetch historical messages. With `dir=b` returns events newest-first.
+    func fetchMessages(roomId: String, from: String, dir: String = "b", limit: Int = 50) async throws -> (events: [MatrixEvent], state: [MatrixEvent], end: String?) {
+        var items: [URLQueryItem] = [
+            URLQueryItem(name: "from", value: from),
+            URLQueryItem(name: "dir", value: dir),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        let json = try await getJSON(
+            path: "/_matrix/client/v3/rooms/\(encode(roomId))/messages",
+            query: items
+        )
+        let chunk = (json["chunk"]?.arrayValue ?? []).compactMap { MatrixEvent.decode(roomId: roomId, value: $0) }
+        let state = (json["state"]?.arrayValue ?? []).compactMap { MatrixEvent.decode(roomId: roomId, value: $0) }
+        return (chunk, state, json["end"]?.stringValue)
+    }
+
+    // MARK: - Encryption — key endpoints (groundwork)
+
+    /// Upload our device's identity + one-time keys. We don't actually generate or use them yet.
+    func uploadKeys(deviceKeys: [String: Any], oneTimeKeys: [String: Any]) async throws -> JSONValue {
+        try await postJSON(path: "/_matrix/client/v3/keys/upload", body: [
+            "device_keys": deviceKeys,
+            "one_time_keys": oneTimeKeys
+        ])
+    }
+
+    /// Query device keys for a set of users.
+    func queryKeys(users: [String]) async throws -> JSONValue {
+        var deviceKeys: [String: [String]] = [:]
+        for u in users { deviceKeys[u] = [] }
+        return try await postJSON(path: "/_matrix/client/v3/keys/query", body: [
+            "device_keys": deviceKeys,
+            "timeout": 10000
+        ])
+    }
+
+    /// Claim one-time keys to start Olm sessions.
+    func claimKeys(_ payload: [String: [String: String]]) async throws -> JSONValue {
+        try await postJSON(path: "/_matrix/client/v3/keys/claim", body: [
+            "one_time_keys": payload,
+            "timeout": 10000
+        ])
     }
 
     // MARK: - Plumbing

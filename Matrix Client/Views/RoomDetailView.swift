@@ -84,6 +84,7 @@ struct RoomDetailView: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
+                    paginationHeader
                     ForEach(items.indices, id: \.self) { idx in
                         let item = items[idx]
                         switch item {
@@ -133,19 +134,69 @@ struct RoomDetailView: View {
     }
 
     private var composer: some View {
-        MessageComposer(
-            text: $draft,
-            replyingTo: $replyingTo,
-            isEncrypted: room.isEncrypted,
-            room: room,
-            onSend: send,
-            onEmoji: { emojiTargetEvent = nil; showEmojiForCompose = true }
-        )
+        VStack(spacing: 0) {
+            typingIndicator
+            MessageComposer(
+                text: $draft,
+                replyingTo: $replyingTo,
+                isEncrypted: room.isEncrypted,
+                room: room,
+                onSend: send,
+                onEmoji: { emojiTargetEvent = nil; showEmojiForCompose = true }
+            )
+        }
         .sheet(isPresented: $showEmojiForCompose) {
             EmojiPickerView { key in
                 showEmojiForCompose = false
                 draft += key
             }
+        }
+    }
+
+    @ViewBuilder
+    private var typingIndicator: some View {
+        if !room.typingUserIds.isEmpty {
+            HStack(spacing: 6) {
+                TypingDots()
+                Text(typingText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 4)
+            .transition(.opacity)
+        }
+    }
+
+    private var typingText: String {
+        let names = room.typingUserIds.map { room.memberDisplayName($0) ?? $0 }.sorted()
+        switch names.count {
+        case 0: return ""
+        case 1: return "\(names[0]) is typing…"
+        case 2: return "\(names[0]) and \(names[1]) are typing…"
+        default: return "\(names[0]), \(names[1]) and \(names.count - 2) more are typing…"
+        }
+    }
+
+    @ViewBuilder
+    private var paginationHeader: some View {
+        if room.prevBatch != nil {
+            HStack {
+                Spacer()
+                if room.paginating {
+                    ProgressView().controlSize(.small)
+                    Text("Loading older messages…")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Button("Load older messages") {
+                        Task { await session.paginate(roomId: room.id) }
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+                Spacer()
+            }
+            .padding(.vertical, 6)
         }
     }
 
@@ -193,5 +244,25 @@ struct RoomDetailView: View {
             lastTs = ev.originServerTs
         }
         return items
+    }
+}
+
+private struct TypingDots: View {
+    @State private var phase: Int = 0
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(Color.secondary)
+                    .frame(width: 4, height: 4)
+                    .opacity(phase == i ? 1 : 0.3)
+            }
+        }
+        .onAppear {
+            Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
+                Task { @MainActor in phase = (phase + 1) % 3 }
+            }
+        }
     }
 }
