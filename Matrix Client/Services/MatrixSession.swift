@@ -73,6 +73,70 @@ final class MatrixSession: ObservableObject {
         }
     }
 
+    /// Begin an OIDC (SSO) flow for the given homeserver. Returns the URL to open in a
+    /// browser and the URL scheme our callback uses. The caller hosts an
+    /// `ASWebAuthenticationSession`, then hands the captured callback URL back to
+    /// `completeOIDC`. On cancel call `cancelOIDC`.
+    private var oidcPendingClient: Client?
+    private var oidcPendingAuthData: OAuthAuthorizationData?
+
+    func beginOIDC(homeserverInput: String) async throws -> (loginURL: URL, callbackScheme: String) {
+        lastError = nil
+        let scheme = "matrixclient"
+        let redirectUri = "\(scheme)://oauth-callback"
+        let client = try await makeClient(homeserverUrlOrServerName: homeserverInput)
+        let details = await client.homeserverLoginDetails()
+        guard details.supportsOidcLogin() else {
+            throw SimpleError("This homeserver doesn't support OIDC sign-in. Try password or set one in your account settings.")
+        }
+        let config = OidcConfiguration(
+            clientName: "Matrix Client (macOS)",
+            redirectUri: redirectUri,
+            clientUri: "https://github.com/anthropics/matrix-client",
+            logoUri: nil,
+            tosUri: nil,
+            policyUri: nil,
+            staticRegistrations: [:]
+        )
+        let authData = try await client.urlForOidc(
+            oidcConfiguration: config,
+            prompt: nil,
+            loginHint: nil,
+            deviceId: nil,
+            additionalScopes: nil
+        )
+        guard let url = URL(string: authData.loginUrl()) else {
+            throw SimpleError("OIDC returned an invalid login URL")
+        }
+        self.oidcPendingClient = client
+        self.oidcPendingAuthData = authData
+        return (url, scheme)
+    }
+
+    /// Finish an OIDC flow with the callback URL returned by ASWebAuthenticationSession.
+    func completeOIDC(callbackURL: URL) async {
+        guard let client = oidcPendingClient else {
+            self.lastError = "No OIDC flow in progress"
+            return
+        }
+        do {
+            try await client.loginWithOidcCallback(callbackUrl: callbackURL.absoluteString)
+            try await activate(client: client, session: try client.session())
+            self.oidcPendingClient = nil
+            self.oidcPendingAuthData = nil
+        } catch {
+            self.lastError = describe(error)
+        }
+    }
+
+    func cancelOIDC() async {
+        if let authData = oidcPendingAuthData, let client = oidcPendingClient {
+            await client.abortOidcAuth(authorizationData: authData)
+        }
+        oidcPendingClient = nil
+        oidcPendingAuthData = nil
+    }
+
     /// Access-token login. We need user/device IDs that match the token; the SDK gives us a
     /// `Client` we can ask for them via whoami after restoring a hand-built `Session`. Since
     /// `restoreSession` requires both, we first do a one-shot REST call to /account/whoami.

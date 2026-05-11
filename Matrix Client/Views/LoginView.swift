@@ -7,6 +7,7 @@ struct LoginView: View {
     @State private var password: String = ""
     @State private var loggingIn = false
     @State private var showTokenSheet = false
+    @State private var ssoSigningIn = false
     @FocusState private var focused: Field?
 
     enum Field { case homeserver, user, password }
@@ -53,6 +54,18 @@ struct LoginView: View {
             .controlSize(.large)
             .disabled(loggingIn || username.isEmpty || password.isEmpty)
 
+            Button(action: signInSSO) {
+                HStack {
+                    if ssoSigningIn { ProgressView().controlSize(.small) }
+                    Image(systemName: "globe")
+                    Text("Continue with SSO / Single Sign-On")
+                }
+                .frame(maxWidth: 260)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .disabled(ssoSigningIn || homeserver.isEmpty)
+
             Button("Sign in with Access Token") { showTokenSheet = true }
                 .buttonStyle(.plain)
                 .font(.caption)
@@ -78,6 +91,29 @@ struct LoginView: View {
         Task {
             await session.login(homeserverInput: homeserver, user: username, password: password)
             loggingIn = false
+        }
+    }
+
+    private func signInSSO() {
+        ssoSigningIn = true
+        Task {
+            do {
+                let (loginURL, scheme) = try await session.beginOIDC(homeserverInput: homeserver)
+                let callback = try await AuthWebSession.start(url: loginURL, callbackURLScheme: scheme)
+                await session.completeOIDC(callbackURL: callback)
+            } catch {
+                await session.cancelOIDC()
+                // Session error already surfaces via session.lastError on most paths;
+                // catch ASWebAuthenticationSession cancellations explicitly so they look
+                // friendly.
+                let ns = error as NSError
+                if ns.domain == "com.apple.AuthenticationServices.WebAuthenticationSession" {
+                    // user closed the auth window — nothing to do
+                } else {
+                    session.lastError = describe(error)
+                }
+            }
+            ssoSigningIn = false
         }
     }
 }
