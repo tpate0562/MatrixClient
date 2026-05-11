@@ -36,6 +36,7 @@ final class RoomVM: ObservableObject, Identifiable {
     private var roomInfoHandle: TaskHandle?
     private var typingHandle: TaskHandle?
     private var listenerBox: AnyObject?
+    private var autoPaginateTask: Task<Void, Never>?
 
     init(room: Room, session: MatrixSession) {
         self.id = room.id()
@@ -61,6 +62,8 @@ final class RoomVM: ObservableObject, Identifiable {
     }
 
     func detach() {
+        autoPaginateTask?.cancel()
+        autoPaginateTask = nil
         timelineHandle = nil
         roomInfoHandle = nil
         typingHandle = nil
@@ -99,7 +102,47 @@ final class RoomVM: ObservableObject, Identifiable {
             }
         }
         self.typingHandle = room.subscribeToTypingNotifications(listener: typingListener)
+
+        // Begin loading the full room history in the background.
+        startAutoPaginate()
     }
+
+    /// Walk backwards through the timeline until the SDK reports no more history. Runs
+    /// in the background so the UI stays interactive. Idempotent — already-running task
+    /// is reused.
+    func startAutoPaginate() {
+        if let t = autoPaginateTask, !t.isCancelled { return }
+        guard timeline != nil, canPaginate else { return }
+        autoPaginateTask = Task { [weak self] in
+            while let self, await !Task.isCancelled {
+                let shouldContinue = await MainActor.run { self.canPaginate && self.timeline != nil }
+                if !shouldContinue { break }
+                await MainActor.run { self.paginating = true }
+                let more: Bool
+                do {
+                    guard let t = await self.timelineHandleSafe else { break }
+                    more = try await t.paginateBackwards(numEvents: 100)
+                } catch {
+                    await MainActor.run {
+                        self.session?.lastError = describe(error)
+                        self.paginating = false
+                    }
+                    break
+                }
+                await MainActor.run {
+                    self.canPaginate = more
+                    self.paginating = false
+                }
+                if !more { break }
+                // Yield briefly so we don't hog the network or the main thread.
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+            await MainActor.run { self?.paginating = false }
+        }
+    }
+
+    /// Background-safe accessor for the timeline handle.
+    private var timelineHandleSafe: Timeline? { timeline }
 
     private func apply(info: RoomInfo) {
         displayName = info.displayName ?? id

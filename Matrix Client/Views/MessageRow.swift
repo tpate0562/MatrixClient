@@ -90,7 +90,6 @@ private struct EventRow: View {
     @EnvironmentObject private var session: MatrixSession
     @EnvironmentObject private var nicknames: NicknameStore
     @State private var hovering = false
-    @State private var hoverX: CGFloat?
 
     private var eventId: String? {
         if case .eventId(let id) = event.eventOrTransactionId { return id }
@@ -146,18 +145,9 @@ private struct EventRow: View {
                 stateLine("\(senderName) — call event")
             }
         }
-        // Make the entire row's horizontal stripe hover-detectable, not just the content.
+        // Make the entire row hover-detectable, not just the content area.
         .contentShape(Rectangle())
-        .onContinuousHover { phase in
-            switch phase {
-            case .active(let loc):
-                hovering = true
-                hoverX = loc.x
-            case .ended:
-                hovering = false
-                hoverX = nil
-            }
-        }
+        .onHover { hovering = $0 }
     }
 
     // MARK: - Message-like
@@ -187,7 +177,7 @@ private struct EventRow: View {
         .padding(.vertical, 1)
         .padding(.horizontal, 4)
         .background(rowBackground)
-        .overlay(alignment: .topLeading) { hoverActionsOverlay }
+        .overlay(alignment: .topTrailing) { hoverActionsOverlay }
         .contextMenu {
             Button("Set Nickname for \(serverSenderName)…") {
                 onEditNickname(event.sender, serverSenderName)
@@ -206,19 +196,15 @@ private struct EventRow: View {
         }
     }
 
-    /// Action bubble that follows the cursor's X position so it's always reachable
-    /// regardless of where on the row you came in. Animated so it feels smooth.
+    /// Pinned to the top-right of the row, visible whenever the cursor is anywhere over
+    /// the row. Stable position — doesn't follow the cursor.
     @ViewBuilder
     private var hoverActionsOverlay: some View {
-        if hovering, let eid = eventId, let x = hoverX {
-            HStack(spacing: 0) {
-                Color.clear.frame(width: max(0, x - 60))
-                hoverActions(eid: eid)
-                Spacer(minLength: 0)
-            }
-            .padding(.top, 2)
-            .allowsHitTesting(true)
-            .animation(.easeOut(duration: 0.12), value: x)
+        if hovering, let eid = eventId {
+            hoverActions(eid: eid)
+                .padding(.top, 2)
+                .padding(.trailing, 8)
+                .allowsHitTesting(true)
         }
     }
 
@@ -279,19 +265,25 @@ private struct EventRow: View {
         switch msg.msgType {
         case .text(let t):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(t.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                Text(MarkdownRenderer.render(t.body))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .tint(.blue)
                 if msg.isEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
             }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .notice(let n):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(n.body).foregroundStyle(.secondary).textSelection(.enabled)
+                Text(MarkdownRenderer.render(n.body))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .tint(.blue)
                 if msg.isEdited { Text("(edited)").font(.caption2).foregroundStyle(.secondary) }
             }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .emote(let e):
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text("* \(senderName) \(e.body)").italic().textSelection(.enabled)
+                Text("* \(senderName) ").italic() + Text(MarkdownRenderer.render(e.body)).italic()
             }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .image(let img):

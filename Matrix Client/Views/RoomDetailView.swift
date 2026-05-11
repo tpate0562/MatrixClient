@@ -106,7 +106,7 @@ struct RoomDetailView: View {
     private var timeline: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
+                LazyVStack(alignment: .leading, spacing: 11) {
                     paginationHeader
                     ForEach(room.items.indices, id: \.self) { idx in
                         let item = room.items[idx]
@@ -176,24 +176,28 @@ struct RoomDetailView: View {
 
     @ViewBuilder
     private var paginationHeader: some View {
-        if room.canPaginate {
-            HStack {
-                Spacer()
-                if room.paginating {
-                    ProgressView().controlSize(.small)
-                    Text("Loading older messages…")
-                        .font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Button("Load older messages") {
-                        Task { await room.paginate() }
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
+        HStack {
+            Spacer()
+            if room.paginating {
+                ProgressView().controlSize(.small)
+                Text("Loading older messages…")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if room.canPaginate {
+                // Auto-pagination should normally kick in on its own; expose a button
+                // anyway in case it's been paused.
+                Button("Load older messages") {
+                    room.startAutoPaginate()
                 }
-                Spacer()
+                .buttonStyle(.borderless)
+                .font(.caption)
+            } else {
+                Text("Start of history")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
-            .padding(.vertical, 6)
+            Spacer()
         }
+        .padding(.vertical, 6)
     }
 
     private func send() {
