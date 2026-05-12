@@ -42,9 +42,15 @@ final class MatrixSession: ObservableObject {
     // MARK: - Lifecycle
 
     /// Build a Client for a homeserver (no session yet). Used as the first step of any flow.
-    private func makeClient(homeserverUrlOrServerName input: String) async throws -> Client {
+    ///
+    /// `freshStart=true` wipes the SDK's on-disk crypto + cache stores before building.
+    /// Required for any path that creates a new device (password login, token login,
+    /// OIDC) — the SDK refuses to attach a new device to a store that was previously
+    /// bound to a different one (errors with "account in the store doesn't match the
+    /// account in the constructor"). Restores keep the existing store.
+    private func makeClient(homeserverUrlOrServerName input: String, freshStart: Bool = false) async throws -> Client {
         try await stop()
-        let paths = try sessionPaths()
+        let paths = try sessionPaths(wipe: freshStart)
         let builder = ClientBuilder()
             .sessionPaths(dataPath: paths.data, cachePath: paths.cache)
             // Cross-sign this device automatically once we have the user's master key
@@ -61,7 +67,7 @@ final class MatrixSession: ObservableObject {
     func login(homeserverInput: String, user: String, password: String) async {
         lastError = nil
         do {
-            let client = try await makeClient(homeserverUrlOrServerName: homeserverInput)
+            let client = try await makeClient(homeserverUrlOrServerName: homeserverInput, freshStart: true)
             try await client.login(
                 username: user, password: password,
                 initialDeviceName: "Matrix Client (macOS)", deviceId: nil
@@ -89,7 +95,7 @@ final class MatrixSession: ObservableObject {
         let clientUri = "https://github.com/tejaspatel/matrix-client"
         let scheme = "com.github.tejaspatel.matrix-client"
         let redirectUri = "\(scheme):/oauth-callback"
-        let client = try await makeClient(homeserverUrlOrServerName: homeserverInput)
+        let client = try await makeClient(homeserverUrlOrServerName: homeserverInput, freshStart: true)
         let details = await client.homeserverLoginDetails()
         guard details.supportsOidcLogin() else {
             throw SimpleError("This homeserver doesn't support OIDC sign-in. Try password or set one in your account settings.")
@@ -150,7 +156,7 @@ final class MatrixSession: ObservableObject {
         do {
             let baseURL = try await resolveHomeserver(input: homeserverInput)
             let who = try await whoami(homeserver: baseURL, token: accessToken)
-            let client = try await makeClient(homeserverUrlOrServerName: baseURL.absoluteString)
+            let client = try await makeClient(homeserverUrlOrServerName: baseURL.absoluteString, freshStart: true)
             let session = Session(
                 accessToken: accessToken,
                 refreshToken: nil,
@@ -463,12 +469,16 @@ final class MatrixSession: ObservableObject {
 
     // MARK: - Helpers
 
-    private func sessionPaths() throws -> (data: String, cache: String) {
+    private func sessionPaths(wipe: Bool = false) throws -> (data: String, cache: String) {
         let fm = FileManager.default
         let support = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         let base = support.appendingPathComponent("MatrixClient/sdk", isDirectory: true)
         let data = base.appendingPathComponent("data", isDirectory: true)
         let cache = base.appendingPathComponent("cache", isDirectory: true)
+        if wipe {
+            try? fm.removeItem(at: data)
+            try? fm.removeItem(at: cache)
+        }
         try fm.createDirectory(at: data, withIntermediateDirectories: true)
         try fm.createDirectory(at: cache, withIntermediateDirectories: true)
         return (data.path, cache.path)
