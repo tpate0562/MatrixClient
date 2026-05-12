@@ -82,10 +82,12 @@ final class MatrixSession: ObservableObject {
 
     func beginOIDC(homeserverInput: String) async throws -> (loginURL: URL, callbackScheme: String) {
         lastError = nil
-        // Per RFC 8252 + matrix-authentication-service: private-use URI schemes must
-        // follow reverse-DNS naming, otherwise the server rejects client registration
-        // with `invalid_redirect_uri`. We use our bundle id (lowercased) as the scheme.
-        let scheme = "tejaspatel.matrix-client"
+        // matrix-authentication-service enforces a Rego policy: the redirect URI's
+        // private-use scheme must be a *reverse-DNS prefix* of the client_uri's host.
+        // So `client_uri = https://github.com/...` forces a scheme that starts with
+        // `com.github.…`. The URI also has to be in `scheme:/path` form (no authority).
+        let clientUri = "https://github.com/tejaspatel/matrix-client"
+        let scheme = "com.github.tejaspatel.matrix-client"
         let redirectUri = "\(scheme):/oauth-callback"
         let client = try await makeClient(homeserverUrlOrServerName: homeserverInput)
         let details = await client.homeserverLoginDetails()
@@ -95,7 +97,7 @@ final class MatrixSession: ObservableObject {
         let config = OidcConfiguration(
             clientName: "Matrix Client (macOS)",
             redirectUri: redirectUri,
-            clientUri: "https://github.com/anthropics/matrix-client",
+            clientUri: clientUri,
             logoUri: nil,
             tosUri: nil,
             policyUri: nil,
