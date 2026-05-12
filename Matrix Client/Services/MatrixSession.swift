@@ -51,14 +51,20 @@ final class MatrixSession: ObservableObject {
     private func makeClient(homeserverUrlOrServerName input: String, freshStart: Bool = false) async throws -> Client {
         try await stop()
         let paths = try sessionPaths(wipe: freshStart)
+        // Configuration mirrors what Element X iOS uses. The decryption / recipient
+        // strategy lines are required for the SDK to actually publish device keys
+        // and treat this device as E2EE-capable; without them other clients see this
+        // session as "doesn't support encryption".
         let builder = ClientBuilder()
             .sessionPaths(dataPath: paths.data, cachePath: paths.cache)
-            // Cross-sign this device automatically once we have the user's master key
-            // (e.g. after the user enters their recovery key). Without this, every
-            // message we send shows as "unverified" in other clients.
+            .userAgent(userAgent: "MatrixClient-macOS/1.0")
+            .slidingSyncVersionBuilder(versionBuilder: .discoverNative)
             .autoEnableCrossSigning(autoEnableCrossSigning: true)
+            .backupDownloadStrategy(backupDownloadStrategy: .afterDecryptionFailure)
+            .enableShareHistoryOnInvite(enableShareHistoryOnInvite: true)
             .autoEnableBackups(autoEnableBackups: true)
-            .backupDownloadStrategy(backupDownloadStrategy: .oneShot)
+            .roomKeyRecipientStrategy(strategy: .errorOnVerifiedUserProblem)
+            .decryptionSettings(decryptionSettings: DecryptionSettings(senderDeviceTrustRequirement: .untrusted))
             .serverNameOrHomeserverUrl(serverNameOrUrl: input.trimmingCharacters(in: .whitespaces))
         return try await builder.build()
     }
@@ -235,6 +241,12 @@ final class MatrixSession: ObservableObject {
         self.verificationState = encryption.verificationState()
 
         await syncService.start()
+
+        // Force the SDK to finish setting up encryption: this triggers device key
+        // generation + upload to /keys/upload if it hasn't happened yet. Without this
+        // the server returns no device keys for our session, and other clients show us
+        // as "doesn't support encryption".
+        await encryption.waitForE2eeInitializationTasks()
 
         // SAS verification controller. Other devices can initiate verification of this
         // device, and we can initiate verification of ourselves from another device.
