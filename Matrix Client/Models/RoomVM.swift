@@ -826,12 +826,14 @@ final class RoomVM: ObservableObject, Identifiable {
     // MARK: - Message cache
 
     struct CachedMessage: Identifiable, Codable {
-        let id: String           // event_id
-        let sender: String
-        let timestamp: Int64     // origin_server_ts in milliseconds
+        let id: String            // event_id
+        let sender: String        // MXID
+        let senderName: String?   // display name from senderProfile (nil for imported)
+        let senderAvatar: String? // MXC URL from senderProfile (nil for imported)
+        let timestamp: Int64      // origin_server_ts in milliseconds
         let body: String
         let formattedBody: String?
-        let isImported: Bool     // true = from Element JSON export
+        let isImported: Bool      // true = from Element JSON export
 
         var date: Date { Date(timeIntervalSince1970: Double(timestamp) / 1000) }
     }
@@ -880,6 +882,8 @@ final class RoomVM: ObservableObject, Identifiable {
                 let msg = CachedMessage(
                     id: event.eventId,
                     sender: event.sender,
+                    senderName: nil,
+                    senderAvatar: nil,
                     timestamp: event.originServerTs,
                     body: event.content.body ?? "",
                     formattedBody: event.content.formattedBody,
@@ -1009,9 +1013,18 @@ private extension TimelineItem {
             html = nil
         }
 
+        var senderDisplayName: String? = nil
+        var senderAvatarMxc: String? = nil
+        if case .ready(let name, _, let avatar) = event.senderProfile {
+            senderDisplayName = name
+            senderAvatarMxc = avatar
+        }
+
         return RoomVM.CachedMessage(
             id: eventId,
             sender: event.sender,
+            senderName: senderDisplayName,
+            senderAvatar: senderAvatarMxc,
             timestamp: Int64(event.timestamp),
             body: body,
             formattedBody: html,

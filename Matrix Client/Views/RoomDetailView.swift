@@ -281,52 +281,79 @@ struct RoomDetailView: View {
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
+    /// A merged, chronologically-ordered display list. Cached messages slot into the
+    /// correct position by timestamp; when the SDK later loads the same event, the
+    /// cached entry is replaced in-place (same stable ID = smooth SwiftUI diff).
+    private var displayItems: [DisplayItem] {
+        let liveIds = Set(room.items.compactMap { item -> String? in
+            guard let event = item.asEvent(),
+                  case .eventId(let eid) = event.eventOrTransactionId else { return nil }
+            return eid
+        })
+        let orphans = room.cachedMessages
+            .filter { !liveIds.contains($0.id) }
+            .sorted { $0.timestamp < $1.timestamp }
+
+        var result: [DisplayItem] = []
+        var cacheIdx = 0
+        for item in room.items {
+            // Flush cached messages older than this live event.
+            if let event = item.asEvent() {
+                let ts = Int64(event.timestamp)
+                while cacheIdx < orphans.count && orphans[cacheIdx].timestamp < ts {
+                    result.append(.cached(orphans[cacheIdx]))
+                    cacheIdx += 1
+                }
+            }
+            result.append(.live(item))
+        }
+        // Any remaining orphans predate all SDK items (e.g. imported / pre-sync-wall history).
+        while cacheIdx < orphans.count {
+            result.append(.cached(orphans[cacheIdx]))
+            cacheIdx += 1
+        }
+        return result
+    }
+
     private var timeline: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    let historical = historicalMessages
-                    if !historical.isEmpty {
-                        ForEach(historical) { msg in
-                            CachedMessageRow(message: msg, members: room.members)
-                                .padding(.top, 8)
-                        }
-                        historicalSeparator(historical)
-                    }
                     paginationHeader
-                    // Use the item's stable unique ID (not the array index) so SwiftUI
-                    // treats prepended history items as insertions rather than replacements.
-                    // Using indices as IDs causes every visible row to be considered
-                    // "changed" when pagination adds items at the front, wrecking scroll position.
-                    let rows = room.items.enumerated().map {
-                        (uid: $0.element.uniqueId().id, idx: $0.offset, item: $0.element)
-                    }
-                    ForEach(rows, id: \.uid) { row in
-                        let idx = row.idx; let item = row.item
-                        let grouped = isGroupContinuation(at: idx)
-                        TimelineRow(
-                            item: item,
-                            room: room,
-                            isGroupContinuation: grouped,
-                            onReact: { id in emojiTargetEventId = id },
-                            onQuickReact: { id, key in
-                                reactionHistory.record(key)
-                                Task { await room.toggleReaction(targetEventId: id, key: key) }
-                            },
-                            onReply: { id in replyingToId = id },
-                            onRedact: { id in Task { await room.redact(eventId: id) } },
-                            onTogglePin: { id in Task { await room.togglePin(eventId: id) } },
-                            onShowSource: { sourceItem = item },
-                            onEditNickname: editNickname,
-                            onEdit: { id, body in
-                                replyingToId = nil
-                                editingId = id
-                                editingOriginalBody = body
-                                draft = body
-                            }
-                        )
-                        .id(item.uniqueId().id)
-                        .padding(.top, grouped ? 1 : 8)
+                    let rows = displayItems
+                    ForEach(Array(rows.enumerated()), id: \.element.stableId) { idx, displayItem in
+                        let grouped = isGroupContinuation(at: idx, in: rows)
+                        switch displayItem {
+                        case .live(let item):
+                            TimelineRow(
+                                item: item,
+                                room: room,
+                                isGroupContinuation: grouped,
+                                onReact: { id in emojiTargetEventId = id },
+                                onQuickReact: { id, key in
+                                    reactionHistory.record(key)
+                                    Task { await room.toggleReaction(targetEventId: id, key: key) }
+                                },
+                                onReply: { id in replyingToId = id },
+                                onRedact: { id in Task { await room.redact(eventId: id) } },
+                                onTogglePin: { id in Task { await room.togglePin(eventId: id) } },
+                                onShowSource: { sourceItem = item },
+                                onEditNickname: editNickname,
+                                onEdit: { id, body in
+                                    replyingToId = nil
+                                    editingId = id
+                                    editingOriginalBody = body
+                                    draft = body
+                                }
+                            )
+                            .id(displayItem.stableId)
+                            .padding(.top, grouped ? 1 : 8)
+                        case .cached(let msg):
+                            CachedMessageRow(message: msg, members: room.members,
+                                             isGroupContinuation: grouped)
+                                .id(displayItem.stableId)
+                                .padding(.top, grouped ? 1 : 8)
+                        }
                     }
                     Color.clear.frame(height: 1).id("__bottom__")
                         .onAppear { isAtBottom = true }
@@ -335,9 +362,6 @@ struct RoomDetailView: View {
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
             .onChange(of: room.items.last?.uniqueId().id) {
-                // Only auto-scroll when a new message arrives at the tail AND the user
-                // is already at the bottom. When the user has scrolled up to read history
-                // we don't want to yank them back down.
                 if isAtBottom {
                     withAnimation(.easeOut(duration: 0.15)) {
                         proxy.scrollTo("__bottom__", anchor: .bottom)
@@ -350,22 +374,14 @@ struct RoomDetailView: View {
         }
     }
 
-    /// Determine if `items[idx]` should be grouped with the previous message
-    /// (same sender, both are message-like events, within 5 minutes).
-    private func isGroupContinuation(at idx: Int) -> Bool {
+    private func isGroupContinuation(at idx: Int, in rows: [DisplayItem]) -> Bool {
         guard idx > 0 else { return false }
-        let current = room.items[idx]
-        let previous = room.items[idx - 1]
-        guard let curEvent = current.asEvent(),
-              let prevEvent = previous.asEvent() else { return false }
-        // Only group message-like events
-        guard case .msgLike = curEvent.content,
-              case .msgLike = prevEvent.content else { return false }
-        // Same sender
-        guard curEvent.sender == prevEvent.sender else { return false }
-        // Within 5 minutes
-        let gap = abs(Int64(curEvent.timestamp) - Int64(prevEvent.timestamp))
-        return gap < 5 * 60 * 1000  // 5 min in milliseconds
+        let cur = rows[idx]; let prev = rows[idx - 1]
+        guard cur.isMsgLike, prev.isMsgLike else { return false }
+        guard let curSender = cur.groupSender, let curTs = cur.groupTimestamp,
+              let prevSender = prev.groupSender, let prevTs = prev.groupTimestamp else { return false }
+        guard curSender == prevSender else { return false }
+        return abs(curTs - prevTs) < 5 * 60 * 1000
     }
 
     private var composer: some View {
@@ -411,41 +427,6 @@ struct RoomDetailView: View {
         case 2: return "\(names[0]) and \(names[1]) are typing…"
         default: return "\(names[0]), \(names[1]) and \(names.count - 2) more are typing…"
         }
-    }
-
-    /// Cached messages that aren't yet represented in the live SDK `items`.
-    private var historicalMessages: [RoomVM.CachedMessage] {
-        let liveIds = Set(room.items.compactMap { item -> String? in
-            guard let event = item.asEvent(),
-                  case .eventId(let eid) = event.eventOrTransactionId else { return nil }
-            return eid
-        })
-        return room.cachedMessages.filter { !liveIds.contains($0.id) }
-    }
-
-    @ViewBuilder
-    private func historicalSeparator(_ msgs: [RoomVM.CachedMessage]) -> some View {
-        let importedCount = msgs.filter(\.isImported).count
-        let cachedCount = msgs.count - importedCount
-        let icon = importedCount > 0 ? "archivebox" : "internaldrive"
-        let label: String = {
-            switch (importedCount > 0, cachedCount > 0) {
-            case (true, true):   return "\(importedCount) imported · \(cachedCount) cached"
-            case (true, false):  return "\(importedCount) imported messages"
-            default:             return "\(cachedCount) cached messages"
-            }
-        }()
-        HStack(spacing: 8) {
-            VStack { Divider() }
-            HStack(spacing: 4) {
-                Image(systemName: icon).font(.caption2)
-                Text(label).font(.caption2)
-            }
-            .foregroundStyle(.tertiary)
-            .fixedSize()
-            VStack { Divider() }
-        }
-        .padding(.vertical, 4)
     }
 
     private var paginationHeader: some View {
@@ -534,46 +515,116 @@ struct NicknameTarget: Identifiable {
     var id: String { userId }
 }
 
+// MARK: - DisplayItem
+
+/// Unified timeline entry — either a live SDK item or a cached/imported message.
+enum DisplayItem {
+    case live(TimelineItem)
+    case cached(RoomVM.CachedMessage)
+
+    /// Stable ID used for ForEach identity. Uses event_id for both sides so a cached
+    /// entry transitions to the live SDK entry in-place rather than remove+insert.
+    var stableId: String {
+        switch self {
+        case .live(let item):
+            if let event = item.asEvent(),
+               case .eventId(let eid) = event.eventOrTransactionId { return eid }
+            return item.uniqueId().id
+        case .cached(let m): return m.id
+        }
+    }
+
+    var groupSender: String? {
+        switch self {
+        case .live(let item):  return item.asEvent()?.sender
+        case .cached(let m):   return m.sender
+        }
+    }
+
+    var groupTimestamp: Int64? {
+        switch self {
+        case .live(let item):
+            guard let event = item.asEvent() else { return nil }
+            return Int64(event.timestamp)
+        case .cached(let m): return m.timestamp
+        }
+    }
+
+    var isMsgLike: Bool {
+        switch self {
+        case .live(let item):
+            guard let event = item.asEvent() else { return false }
+            if case .msgLike = event.content { return true }
+            return false
+        case .cached: return true
+        }
+    }
+}
+
+// MARK: - CachedMessageRow
+
 private struct CachedMessageRow: View {
     let message: RoomVM.CachedMessage
     let members: [String: RoomMember]
+    var isGroupContinuation: Bool = false
 
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .short
-        f.timeStyle = .short
-        return f
-    }()
+    private var displayName: String {
+        // Prefer the cached display name (from senderProfile at fetch time),
+        // then members lookup, then MXID localpart.
+        if let n = message.senderName { return n }
+        if let n = members[message.sender]?.displayName { return n }
+        return String(message.sender.split(separator: ":").first?.dropFirst()
+            ?? Substring(message.sender))
+    }
 
-    private var senderName: String {
-        if let name = members[message.sender]?.displayName { return name }
-        return String(message.sender.split(separator: ":").first?.dropFirst() ?? Substring(message.sender))
+    private var avatarUrl: String? {
+        message.senderAvatar ?? members[message.sender]?.avatarUrl
+    }
+
+    private func senderColor(for userId: String) -> Color {
+        let palette: [Color] = [.blue, .green, .orange, .purple, .pink, .red, .teal, .indigo, .mint, .cyan]
+        var hash = 0
+        for u in userId.unicodeScalars { hash = hash &+ Int(u.value) }
+        return palette[abs(hash) % palette.count]
+    }
+
+    private func timeFull(_ d: Date) -> String {
+        let f = DateFormatter(); f.timeStyle = .short; return f.string(from: d)
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            Avatar(name: senderName, mxc: members[message.sender]?.avatarUrl, size: 28)
-                .opacity(0.7)
+            if !isGroupContinuation {
+                Avatar(name: displayName, mxc: avatarUrl, size: 32)
+            } else {
+                Color.clear.frame(width: 32, height: 0)
+            }
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(senderName)
-                        .font(.caption.bold())
-                        .foregroundStyle(.secondary)
-                    Text(Self.timeFormatter.string(from: message.date))
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    if message.isImported {
-                        Image(systemName: "archivebox")
-                            .font(.caption2)
+                if !isGroupContinuation {
+                    HStack(spacing: 6) {
+                        Text(displayName)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(senderColor(for: message.sender))
+                        Text(timeFull(message.date))
+                            .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
+                        if message.isImported {
+                            Image(systemName: "archivebox")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.tertiary)
+                                .help("Imported from Element export")
+                        }
                     }
                 }
                 Text(message.body)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 60)
         }
+        .padding(.vertical, isGroupContinuation ? 0 : 1)
+        .padding(.horizontal, 4)
     }
 }
