@@ -6,6 +6,8 @@ import MatrixRustSDK
 struct TimelineRow: View {
     let item: TimelineItem
     @ObservedObject var room: RoomVM
+    var isGroupContinuation: Bool = false
+
     let onReact: (String) -> Void
     let onQuickReact: (String, String) -> Void
     let onReply: (String) -> Void
@@ -13,6 +15,7 @@ struct TimelineRow: View {
     let onTogglePin: (String) -> Void
     let onShowSource: () -> Void
     let onEditNickname: (String, String) -> Void
+    let onEdit: (String, String) -> Void
 
     var body: some View {
         if let virtual = item.asVirtual() {
@@ -21,13 +24,15 @@ struct TimelineRow: View {
             EventRow(
                 event: event,
                 room: room,
+                isGroupContinuation: isGroupContinuation,
                 onReact: onReact,
                 onQuickReact: onQuickReact,
                 onReply: onReply,
                 onRedact: onRedact,
                 onTogglePin: onTogglePin,
                 onShowSource: onShowSource,
-                onEditNickname: onEditNickname
+                onEditNickname: onEditNickname,
+                onEdit: onEdit
             )
         }
     }
@@ -79,6 +84,7 @@ private struct VirtualRow: View {
 private struct EventRow: View {
     let event: EventTimelineItem
     @ObservedObject var room: RoomVM
+    var isGroupContinuation: Bool = false
     let onReact: (String) -> Void
     let onQuickReact: (String, String) -> Void
     let onReply: (String) -> Void
@@ -86,9 +92,11 @@ private struct EventRow: View {
     let onTogglePin: (String) -> Void
     let onShowSource: () -> Void
     let onEditNickname: (String, String) -> Void
+    let onEdit: (String, String) -> Void
 
     @EnvironmentObject private var session: MatrixSession
     @EnvironmentObject private var nicknames: NicknameStore
+    @EnvironmentObject private var reactionHistory: ReactionHistoryStore
     @State private var hovering = false
     @State private var revealedSpoilers: Set<Int> = []
 
@@ -122,6 +130,15 @@ private struct EventRow: View {
     }
 
     private var isOwn: Bool { event.isOwn }
+
+    private var rawBody: String? {
+        if case .msgLike(let content) = event.content,
+           case .message(let msg) = content.kind,
+           case .text(let txt) = msg.msgType {
+            return txt.body
+        }
+        return nil
+    }
 
     var body: some View {
         Group {
@@ -160,28 +177,66 @@ private struct EventRow: View {
                 // Right-aligned own message: spacer pushes content to the right.
                 Spacer(minLength: 60)
                 VStack(alignment: .trailing, spacing: 2) {
-                    senderLine
-                    kindBody(content.kind, content: content, ownAlignment: .trailing)
+                    if !isGroupContinuation { senderLine }
+                    replyPreview(content.inReplyTo, alignment: .trailing)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        if isGroupContinuation { continuationTimeLine }
+                        kindBody(content.kind, content: content, ownAlignment: .trailing)
+                    }
                     reactionsRow(content.reactions, alignment: .trailing)
+                    readReceiptsRow(alignment: .trailing)
                 }
-                Avatar(name: senderName, mxc: senderAvatar, size: 32)
+                if !isGroupContinuation {
+                    Avatar(name: senderName, mxc: senderAvatar, size: 32)
+                } else {
+                    Color.clear.frame(width: 32, height: 0)
+                }
             } else {
-                Avatar(name: senderName, mxc: senderAvatar, size: 32)
+                if !isGroupContinuation {
+                    Avatar(name: senderName, mxc: senderAvatar, size: 32)
+                } else {
+                    Color.clear.frame(width: 32, height: 0)
+                }
                 VStack(alignment: .leading, spacing: 2) {
-                    senderLine
-                    kindBody(content.kind, content: content, ownAlignment: .leading)
+                    if !isGroupContinuation { senderLine }
+                    replyPreview(content.inReplyTo, alignment: .leading)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        kindBody(content.kind, content: content, ownAlignment: .leading)
+                        if isGroupContinuation { continuationTimeLine }
+                    }
                     reactionsRow(content.reactions, alignment: .leading)
+                    readReceiptsRow(alignment: .leading)
                 }
                 Spacer(minLength: 60)
             }
         }
-        .padding(.vertical, 1)
+        .padding(.vertical, isGroupContinuation ? 0 : 1)
         .padding(.horizontal, 4)
         .background(rowBackground)
-        .overlay(alignment: .topTrailing) { hoverActionsOverlay }
+        .overlay(alignment: isOwn ? .topLeading : .topTrailing) { hoverActionsOverlay }
         .contextMenu {
-            Button("Set Nickname for \(serverSenderName)…") {
-                onEditNickname(event.sender, serverSenderName)
+            if let eid = eventId {
+                if event.canBeRepliedTo {
+                    Button("Reply") { onReply(eid) }
+                }
+                Button(isPinned ? "Unpin" : "Pin") { onTogglePin(eid) }
+                Divider()
+                Button("View Source", action: onShowSource)
+                Button("Set Nickname for \(serverSenderName)…") {
+                    onEditNickname(event.sender, serverSenderName)
+                }
+                if event.isOwn || event.isEditable {
+                    Divider()
+                    if event.isEditable, let body = rawBody {
+                        Button("Edit") { onEdit(eid, body) }
+                    }
+                    Button("Redact", role: .destructive) { onRedact(eid) }
+                }
+            } else {
+                Button("View Source", action: onShowSource)
+                Button("Set Nickname for \(serverSenderName)…") {
+                    onEditNickname(event.sender, serverSenderName)
+                }
             }
         }
     }
@@ -204,7 +259,7 @@ private struct EventRow: View {
         if hovering, let eid = eventId {
             hoverActions(eid: eid)
                 .padding(.top, 2)
-                .padding(.trailing, 8)
+                .padding(isOwn ? .leading : .trailing, 8)
                 .allowsHitTesting(true)
         }
     }
@@ -212,10 +267,15 @@ private struct EventRow: View {
     @ViewBuilder
     private func hoverActions(eid: String) -> some View {
         HStack(spacing: 4) {
-            Button { onQuickReact(eid, "👍") } label: { Text("👍").font(.system(size: 13)) }
-                .buttonStyle(.plain).help("React 👍")
+            ForEach(reactionHistory.top3, id: \.self) { emoji in
+                Button {
+                    reactionHistory.record(emoji)
+                    onQuickReact(eid, emoji)
+                } label: { Text(emoji).font(.system(size: 13)) }
+                .buttonStyle(.plain).help("React \(emoji)")
+            }
             Button { onReact(eid) } label: { Image(systemName: "face.smiling") }
-                .buttonStyle(.plain).help("React")
+                .buttonStyle(.plain).help("More reactions…")
             Menu {
                 if event.canBeRepliedTo {
                     Button("Reply") { onReply(eid) }
@@ -227,6 +287,9 @@ private struct EventRow: View {
                 }
                 if event.isOwn || event.isEditable {
                     Divider()
+                    if event.isEditable, let body = rawBody {
+                        Button("Edit") { onEdit(eid, body) }
+                    }
                     Button("Redact", role: .destructive) { onRedact(eid) }
                 }
             } label: { Image(systemName: "ellipsis") }
@@ -266,12 +329,19 @@ private struct EventRow: View {
         switch msg.msgType {
         case .text(let t):
             let (attr, count) = MarkdownRenderer.render(body: t.body, formatted: t.formatted, revealedSpoilers: revealedSpoilers)
-            renderableTextBody(
-                attributed: attr,
-                spoilerCount: count,
-                edited: msg.isEdited,
-                alignment: bubbleAlignment
-            )
+            VStack(alignment: alignment, spacing: 4) {
+                renderableTextBody(
+                    attributed: attr,
+                    spoilerCount: count,
+                    edited: msg.isEdited,
+                    alignment: bubbleAlignment
+                )
+                if let url = attr.firstURL() {
+                    LinkPreview(url: url)
+                        .frame(maxWidth: 350, minHeight: 40)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+            }
         case .notice(let n):
             let (attr, count) = MarkdownRenderer.render(body: n.body, formatted: n.formatted, revealedSpoilers: revealedSpoilers)
             renderableTextBody(
@@ -499,6 +569,27 @@ private struct EventRow: View {
         }
     }
 
+    /// Compact time-only line shown for continuation messages in a group.
+    /// Only visible on hover to keep grouped messages clean.
+    @ViewBuilder
+    private var continuationTimeLine: some View {
+        HStack(spacing: 4) {
+            Text(timeFull(date))
+                .font(.system(size: 9))
+                .foregroundStyle(.quaternary)
+                .opacity(hovering ? 1 : 0)
+            if isPinned {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+            }
+            if let status = event.localSendState, !isSent(status) {
+                Text(sendStateLabel(status)).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .frame(height: hovering ? nil : 0)
+    }
+
     @ViewBuilder
     private func reactionsRow(_ reactions: [Reaction], alignment: HorizontalAlignment) -> some View {
         if !reactions.isEmpty, let eid = eventId {
@@ -513,6 +604,111 @@ private struct EventRow: View {
                 if alignment == .leading { Spacer() }
             }
             .padding(.top, 2)
+        }
+    }
+
+    // MARK: - Reply preview
+
+    @ViewBuilder
+    private func replyPreview(_ details: InReplyToDetails?, alignment: HorizontalAlignment) -> some View {
+        if let details {
+            let ev = details.event()
+            HStack(spacing: 6) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.accentColor.opacity(0.6))
+                    .frame(width: 3)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(replySenderName(ev))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(senderColor(for: replySenderId(ev)))
+                    Text(replyBodyPreview(ev))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            .padding(.vertical, 3)
+            .padding(.horizontal, 6)
+            .background(Color.secondary.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
+        }
+    }
+
+    private func replySenderName(_ ev: EmbeddedEventDetails) -> String {
+        switch ev {
+        case .ready(_, let sender, let profile, _, _):
+            // Use local nickname if set, otherwise server display name
+            let serverName: String?
+            if case .ready(let name, _, _) = profile { serverName = name } else { serverName = nil }
+            return nicknames.displayName(for: sender, fallback: serverName)
+        default: return "Unknown"
+        }
+    }
+
+    private func replySenderId(_ ev: EmbeddedEventDetails) -> String {
+        switch ev {
+        case .ready(_, let sender, _, _, _): return sender
+        default: return ""
+        }
+    }
+
+    private func replyBodyPreview(_ ev: EmbeddedEventDetails) -> String {
+        switch ev {
+        case .ready(let content, _, _, _, _):
+            switch content {
+            case .msgLike(let msg):
+                switch msg.kind {
+                case .message(let m):
+                    switch m.msgType {
+                    case .text(let t): return t.body
+                    case .notice(let n): return n.body
+                    case .emote(let e): return e.body
+                    case .image: return "🖼 Image"
+                    case .video: return "🎥 Video"
+                    case .audio: return "🎵 Audio"
+                    case .file: return "📄 File"
+                    default: return "Message"
+                    }
+                case .redacted: return "(deleted)"
+                case .unableToDecrypt: return "🔒 Encrypted"
+                default: return "Event"
+                }
+            default: return "Event"
+            }
+        case .pending: return "Loading…"
+        case .unavailable: return "Message unavailable"
+        case .error(let msg): return "Error: \(msg)"
+        }
+    }
+
+    // MARK: - Read receipts
+
+    @ViewBuilder
+    private func readReceiptsRow(alignment: HorizontalAlignment) -> some View {
+        let receipts = event.readReceipts
+            .filter { $0.key != session.currentUserId }
+        if !receipts.isEmpty {
+            HStack(spacing: -4) {
+                if alignment == .trailing { Spacer() }
+                ForEach(Array(receipts.keys.sorted().prefix(5)), id: \.self) { userId in
+                    let member = room.members[userId]
+                    let name = member?.displayName ?? String(userId.prefix(8))
+                    let avatar = member?.avatarUrl
+                    Avatar(name: name, mxc: avatar, size: 14)
+                        .overlay(
+                            Circle().stroke(Color(.windowBackgroundColor), lineWidth: 1)
+                        )
+                }
+                if receipts.count > 5 {
+                    Text("+\(receipts.count - 5)")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 6)
+                }
+                if alignment == .leading { Spacer() }
+            }
+            .padding(.top, 1)
         }
     }
 
@@ -535,7 +731,23 @@ private struct EventRow: View {
     private func sendStateLabel(_ s: EventSendState) -> String {
         switch s {
         case .notSentYet: return "sending"
-        case .sendingFailed: return "failed"
+        case .sendingFailed(let error, let isRecoverable):
+            let detail: String
+            switch error {
+            case .insecureDevices(let map):
+                detail = "insecure devices: \(map)"
+            case .identityViolations(let users):
+                detail = "identity violations: \(users)"
+            case .crossVerificationRequired:
+                detail = "cross-verification required"
+            case .missingMediaContent:
+                detail = "missing media"
+            case .invalidMimeType(let m):
+                detail = "bad mime: \(m)"
+            case .genericApiError(let msg):
+                detail = msg
+            }
+            return "failed: \(detail)"
         case .sent: return "sent"
         }
     }
@@ -553,9 +765,24 @@ private struct EventRow: View {
                     useCache: true,
                     tempDir: nil
                 )
-                let path = try handle.path()
+                let sdkPath = try handle.path()
+                let sdkUrl = URL(fileURLWithPath: sdkPath)
+                
+                // The SDK's MediaFile handle deletes the file when deallocated.
+                // Copy it to our own temp directory so it survives long enough
+                // for macOS Preview/QuickLook to open it.
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+                let destUrl = tmp.appendingPathComponent(filename)
+                
+                if FileManager.default.fileExists(atPath: destUrl.path) {
+                    try FileManager.default.removeItem(at: destUrl)
+                }
+                try FileManager.default.copyItem(at: sdkUrl, to: destUrl)
+                
                 await MainActor.run {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                    NSWorkspace.shared.open(destUrl)
                 }
             } catch {
                 // Best-effort fallback: write raw bytes to a temp file.
@@ -569,5 +796,38 @@ private struct EventRow: View {
                 }
             }
         }
+    }
+}
+
+import LinkPresentation
+
+struct LinkPreview: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> LPLinkView {
+        let view = LPLinkView(url: url)
+        LPMetadataProvider().startFetchingMetadata(for: url) { metadata, error in
+            if let metadata = metadata {
+                DispatchQueue.main.async {
+                    view.metadata = metadata
+                    // Re-layout container
+                    view.needsLayout = true
+                }
+            }
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: LPLinkView, context: Context) {}
+}
+
+extension AttributedString {
+    func firstURL() -> URL? {
+        for run in self.runs {
+            if let url = run.link, url.scheme != "spoiler" {
+                return url
+            }
+        }
+        return nil
     }
 }

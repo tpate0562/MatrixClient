@@ -40,6 +40,9 @@ final class PinnedEventsVM: ObservableObject {
             }
             self.listenerBox = listener
             self.handle = await t.addListener(listener: listener)
+            // Paginate to trigger the SDK to fetch pinned events from the server.
+            // Without this, events not in the local SQLite cache are never delivered.
+            _ = try? await t.paginateBackwards(numEvents: 50)
         } catch {
             self.error = describe(error)
         }

@@ -1,9 +1,36 @@
 import SwiftUI
 import MatrixRustSDK
 
+private enum SearchMode: String, CaseIterable {
+    case exact = "Exact"
+    case closest = "Best Match"
+}
+
+private func messageText(from item: TimelineItem) -> String? {
+    guard let event = item.asEvent(),
+          case .msgLike(let content) = event.content,
+          case .message(let msg) = content.kind,
+          case .text(let t) = msg.msgType else { return nil }
+    return t.body
+}
+
+private func fuzzyScore(query: String, in text: String) -> Double {
+    let q = query.lowercased(), t = text.lowercased()
+    var qi = q.startIndex
+    var matched = 0
+    for ch in t {
+        if qi < q.endIndex && ch == q[qi] {
+            matched += 1
+            qi = q.index(after: qi)
+        }
+    }
+    return q.isEmpty ? 0 : Double(matched) / Double(q.count)
+}
+
 struct RoomDetailView: View {
     @ObservedObject var room: RoomVM
     @EnvironmentObject private var session: MatrixSession
+    @EnvironmentObject private var reactionHistory: ReactionHistoryStore
     @State private var draft: String = ""
     @State private var showAdmin = false
     @State private var showPins = false
@@ -11,17 +38,46 @@ struct RoomDetailView: View {
     @State private var emojiTargetEventId: String?
     @State private var showEmojiForCompose = false
     @State private var replyingToId: String?
+    @State private var editingId: String?
+    @State private var editingOriginalBody: String = ""
     @State private var nicknameTarget: NicknameTarget?
+    @State private var showSearch = false
+    @State private var searchQuery = ""
+    @State private var searchMode: SearchMode = .exact
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            timeline
+            if showSearch { searchBar }
+            if showSearch && !searchQuery.isEmpty {
+                searchResultsView
+            } else {
+                timeline
+            }
             Divider()
             composer
         }
         .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await room.forceReload() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                .help("Force reload messages (⌘R)")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    withAnimation { showSearch.toggle() }
+                    if !showSearch { searchQuery = "" }
+                } label: {
+                    Label("Search", systemImage: showSearch ? "magnifyingglass.circle.fill" : "magnifyingglass")
+                }
+                .keyboardShortcut("f", modifiers: .command)
+                .help("Search messages (⌘F)")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button { showPins = true } label: {
                     Label("Pinned (\(room.pinnedEventIds.count))", systemImage: "pin")
@@ -53,6 +109,7 @@ struct RoomDetailView: View {
             set: { emojiTargetEventId = $0?.eventId }
         )) { target in
             EmojiPickerView { key in
+                reactionHistory.record(key)
                 emojiTargetEventId = nil
                 Task { await room.toggleReaction(targetEventId: target.eventId, key: key) }
             }
@@ -74,6 +131,104 @@ struct RoomDetailView: View {
 
     private func editNickname(userId: String, name: String) {
         nicknameTarget = NicknameTarget(userId: userId, fallbackName: name)
+    }
+
+    // MARK: - Search
+
+    private var searchBar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
+                TextField("Search messages…", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                if !searchQuery.isEmpty {
+                    Button { searchQuery = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Picker("", selection: $searchMode) {
+                    ForEach(SearchMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 150)
+                Button("Done") {
+                    withAnimation { showSearch = false }
+                    searchQuery = ""
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            Divider()
+        }
+    }
+
+    private var searchResults: [TimelineItem] {
+        guard !searchQuery.isEmpty else { return [] }
+        let query = searchQuery.lowercased()
+        switch searchMode {
+        case .exact:
+            return room.items.filter { item in
+                guard let text = messageText(from: item) else { return false }
+                return text.lowercased().contains(query)
+            }
+        case .closest:
+            return room.items
+                .compactMap { item -> (TimelineItem, Double)? in
+                    guard let text = messageText(from: item) else { return nil }
+                    let score = fuzzyScore(query: query, in: text)
+                    return score >= 0.6 ? (item, score) : nil
+                }
+                .sorted { $0.1 > $1.1 }
+                .map(\.0)
+        }
+    }
+
+    private var searchResultsView: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if searchResults.isEmpty {
+                    Text("No results for "\(searchQuery)"")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .padding().frame(maxWidth: .infinity)
+                } else {
+                    Text("\(searchResults.count) result\(searchResults.count == 1 ? "" : "s")")
+                        .font(.caption).foregroundStyle(.tertiary)
+                        .padding(.horizontal, 12).padding(.top, 8)
+                    ForEach(searchResults.indices, id: \.self) { idx in
+                        let item = searchResults[idx]
+                        TimelineRow(
+                            item: item,
+                            room: room,
+                            isGroupContinuation: false,
+                            onReact: { id in emojiTargetEventId = id },
+                            onQuickReact: { id, key in
+                                reactionHistory.record(key)
+                                Task { await room.toggleReaction(targetEventId: id, key: key) }
+                            },
+                            onReply: { id in replyingToId = id; withAnimation { showSearch = false }; searchQuery = "" },
+                            onRedact: { id in Task { await room.redact(eventId: id) } },
+                            onTogglePin: { id in Task { await room.togglePin(eventId: id) } },
+                            onShowSource: { sourceItem = item },
+                            onEditNickname: editNickname,
+                            onEdit: { id, body in
+                                replyingToId = nil
+                                editingId = id
+                                editingOriginalBody = body
+                                draft = body
+                                withAnimation { showSearch = false }
+                                searchQuery = ""
+                            }
+                        )
+                        .id(item.uniqueId().id)
+                        .padding(.top, 8)
+                    }
+                }
+            }
+            .padding(.horizontal, 12).padding(.bottom, 8)
+        }
     }
 
     private var header: some View {
@@ -106,28 +261,42 @@ struct RoomDetailView: View {
     private var timeline: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 11) {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     paginationHeader
                     ForEach(room.items.indices, id: \.self) { idx in
                         let item = room.items[idx]
+                        let grouped = isGroupContinuation(at: idx)
                         TimelineRow(
                             item: item,
                             room: room,
+                            isGroupContinuation: grouped,
                             onReact: { id in emojiTargetEventId = id },
-                            onQuickReact: { id, key in Task { await room.toggleReaction(targetEventId: id, key: key) } },
+                            onQuickReact: { id, key in
+                                reactionHistory.record(key)
+                                Task { await room.toggleReaction(targetEventId: id, key: key) }
+                            },
                             onReply: { id in replyingToId = id },
                             onRedact: { id in Task { await room.redact(eventId: id) } },
                             onTogglePin: { id in Task { await room.togglePin(eventId: id) } },
                             onShowSource: { sourceItem = item },
-                            onEditNickname: editNickname
+                            onEditNickname: editNickname,
+                            onEdit: { id, body in
+                                replyingToId = nil
+                                editingId = id
+                                editingOriginalBody = body
+                                draft = body
+                            }
                         )
                         .id(item.uniqueId().id)
+                        .padding(.top, grouped ? 1 : 8)
                     }
                     Color.clear.frame(height: 1).id("__bottom__")
                 }
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
-            .onChange(of: room.items.count) {
+            .onChange(of: room.items.last?.uniqueId().id) {
+                // Only scroll to the bottom when a new message arrives at the tail.
+                // Pagination prepends older items, so the last item ID stays the same — skip those.
                 withAnimation { proxy.scrollTo("__bottom__", anchor: .bottom) }
             }
             .onAppear {
@@ -136,15 +305,40 @@ struct RoomDetailView: View {
         }
     }
 
+    /// Determine if `items[idx]` should be grouped with the previous message
+    /// (same sender, both are message-like events, within 5 minutes).
+    private func isGroupContinuation(at idx: Int) -> Bool {
+        guard idx > 0 else { return false }
+        let current = room.items[idx]
+        let previous = room.items[idx - 1]
+        guard let curEvent = current.asEvent(),
+              let prevEvent = previous.asEvent() else { return false }
+        // Only group message-like events
+        guard case .msgLike = curEvent.content,
+              case .msgLike = prevEvent.content else { return false }
+        // Same sender
+        guard curEvent.sender == prevEvent.sender else { return false }
+        // Within 5 minutes
+        let gap = abs(Int64(curEvent.timestamp) - Int64(prevEvent.timestamp))
+        return gap < 5 * 60 * 1000  // 5 min in milliseconds
+    }
+
     private var composer: some View {
         VStack(spacing: 0) {
             typingIndicator
             MessageComposer(
                 text: $draft,
                 replyingToId: $replyingToId,
+                editingId: $editingId,
                 room: room,
                 onSend: send,
-                onEmoji: { showEmojiForCompose = true }
+                onEmoji: { showEmojiForCompose = true },
+                onAttach: { urls in
+                    Task { await room.sendAttachments(urls) }
+                },
+                onPasteData: { data, filename, mime in
+                    Task { await room.sendData(data, filename: filename, mime: mime) }
+                }
             )
         }
     }
@@ -205,9 +399,18 @@ struct RoomDetailView: View {
         guard !text.isEmpty else { return }
         draft = ""
         let replyTo = replyingToId
+        let editTarget = editingId
+        let originalBody = editingOriginalBody
         replyingToId = nil
+        editingId = nil
+        editingOriginalBody = ""
         Task {
-            if let replyTo {
+            if let editTarget {
+                // Skip the edit if the content didn't actually change.
+                if text != originalBody.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    await room.sendEdit(to: editTarget, text: text)
+                }
+            } else if let replyTo {
                 await room.sendReply(to: replyTo, text: text)
             } else {
                 await room.send(text)
