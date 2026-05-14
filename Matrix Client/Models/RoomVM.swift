@@ -49,6 +49,10 @@ final class RoomVM: ObservableObject, Identifiable {
     private var bridgeBox: AnyObject?
     private var bridgeItems: [TimelineItem] = []
 
+    // Persisted message cache — loaded from disk on open, updated after each diff burst.
+    @Published var cachedMessages: [CachedMessage] = []
+    private var saveCacheDebounce: Task<Void, Never>?
+
     // Long-lived pinned-events timeline. We mirror its event IDs into
     // `pinnedEventIds` so the inline pin indicator updates immediately, even
     // when RoomInfo's pinnedEventIds list is slow to refresh after a pin.
@@ -84,6 +88,8 @@ final class RoomVM: ObservableObject, Identifiable {
     func detach() {
         autoPaginateTask?.cancel()
         autoPaginateTask = nil
+        saveCacheDebounce?.cancel()
+        saveCacheDebounce = nil
         timelineHandle = nil
         roomInfoHandle = nil
         typingHandle = nil
@@ -141,6 +147,9 @@ final class RoomVM: ObservableObject, Identifiable {
             }
         }
         self.typingHandle = room.subscribeToTypingNotifications(listener: typingListener)
+
+        // Pre-populate the timeline from disk so history is visible before pagination finishes.
+        loadCache()
 
         // Begin loading the full room history in the background.
         startAutoPaginate()
@@ -455,6 +464,8 @@ final class RoomVM: ObservableObject, Identifiable {
         }
         newItems.append(contentsOf: sdkItems)
         items = newItems
+
+        scheduleCacheSave()
     }
 
     // MARK: - Timeline actions
@@ -812,62 +823,79 @@ final class RoomVM: ObservableObject, Identifiable {
         do { try await room.leave() } catch { session?.lastError = describe(error) }
     }
 
-    // MARK: - Element JSON import
+    // MARK: - Message cache
 
-    struct ImportedEvent: Identifiable, Codable {
-        let eventId: String
+    struct CachedMessage: Identifiable, Codable {
+        let id: String           // event_id
         let sender: String
-        let originServerTs: Int64
-        let type: String
-        let content: ImportedEventContent
-
-        var id: String { eventId }
-        var date: Date { Date(timeIntervalSince1970: Double(originServerTs) / 1000) }
-
-        private enum CodingKeys: String, CodingKey {
-            case eventId = "event_id"
-            case sender
-            case originServerTs = "origin_server_ts"
-            case type
-            case content
-        }
-    }
-
-    struct ImportedEventContent: Codable {
-        let msgtype: String?
-        let body: String?
+        let timestamp: Int64     // origin_server_ts in milliseconds
+        let body: String
         let formattedBody: String?
+        let isImported: Bool     // true = from Element JSON export
 
-        private enum CodingKeys: String, CodingKey {
-            case msgtype
-            case body
-            case formattedBody = "formatted_body"
+        var date: Date { Date(timeIntervalSince1970: Double(timestamp) / 1000) }
+    }
+
+    private func loadCache() {
+        cachedMessages = CacheStore.load(roomId: id)
+    }
+
+    /// Coalesces rapid diff bursts into a single write ~2 s after the last change.
+    private func scheduleCacheSave() {
+        saveCacheDebounce?.cancel()
+        saveCacheDebounce = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            let (roomId, snapshot) = await MainActor.run { (self.id, self.buildCacheSnapshot()) }
+            CacheStore.save(snapshot, roomId: roomId)
+            await MainActor.run { self.cachedMessages = snapshot }
         }
     }
 
-    @Published var importedEvents: [ImportedEvent] = []
+    /// Merges imported entries with messages extracted from the current SDK `items`.
+    private func buildCacheSnapshot() -> [CachedMessage] {
+        var byId: [String: CachedMessage] = Dictionary(
+            uniqueKeysWithValues: cachedMessages.map { ($0.id, $0) }
+        )
+        for item in items {
+            guard let msg = item.toCachedMessage() else { continue }
+            byId[msg.id] = msg
+        }
+        return byId.values.sorted { $0.timestamp < $1.timestamp }
+    }
 
-    /// Parses one or more Element JSON export files and prepends their events (deduped,
-    /// oldest-first) to `importedEvents`. Only `m.room.message` events are kept.
+    /// Parses one or more Element JSON export files and merges them into the cache.
+    /// Only `m.room.message` events are kept.
     func loadImport(from urls: [URL]) {
-        var merged: [String: ImportedEvent] = Dictionary(
-            uniqueKeysWithValues: importedEvents.map { ($0.eventId, $0) }
+        var byId: [String: CachedMessage] = Dictionary(
+            uniqueKeysWithValues: cachedMessages.map { ($0.id, $0) }
         )
         let decoder = JSONDecoder()
         for url in urls {
             _ = url.startAccessingSecurityScopedResource()
             defer { url.stopAccessingSecurityScopedResource() }
             guard let data = try? Data(contentsOf: url),
-                  let events = try? decoder.decode([ImportedEvent].self, from: data) else { continue }
+                  let events = try? decoder.decode([_ElementExportEvent].self, from: data) else { continue }
             for event in events where event.type == "m.room.message" {
-                merged[event.eventId] = event
+                let msg = CachedMessage(
+                    id: event.eventId,
+                    sender: event.sender,
+                    timestamp: event.originServerTs,
+                    body: event.content.body ?? "",
+                    formattedBody: event.content.formattedBody,
+                    isImported: true
+                )
+                byId[msg.id] = msg
             }
         }
-        importedEvents = merged.values.sorted { $0.originServerTs < $1.originServerTs }
+        let sorted = byId.values.sorted { $0.timestamp < $1.timestamp }
+        cachedMessages = sorted
+        CacheStore.save(sorted, roomId: id)
     }
 
     func clearImport() {
-        importedEvents = []
+        cachedMessages = cachedMessages.filter { !$0.isImported }
+        CacheStore.save(cachedMessages, roomId: id)
     }
 
     // MARK: - Convenience
@@ -896,4 +924,98 @@ final class TypingBox: TypingNotificationsListener, @unchecked Sendable {
     let cb: @Sendable ([String]) -> Void
     init(_ cb: @escaping @Sendable ([String]) -> Void) { self.cb = cb }
     func call(typingUserIds: [String]) { cb(typingUserIds) }
+}
+
+// MARK: - CacheStore
+
+private enum CacheStore {
+    static func load(roomId: String) -> [RoomVM.CachedMessage] {
+        guard let url = url(for: roomId),
+              let data = try? Data(contentsOf: url) else { return [] }
+        return (try? JSONDecoder().decode([RoomVM.CachedMessage].self, from: data)) ?? []
+    }
+
+    static func save(_ messages: [RoomVM.CachedMessage], roomId: String) {
+        guard let url = url(for: roomId) else { return }
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(messages) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    private static func url(for roomId: String) -> URL? {
+        guard let support = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let safe = roomId
+            .replacingOccurrences(of: "!", with: "")
+            .replacingOccurrences(of: ":", with: "_")
+        return support
+            .appendingPathComponent("MatrixClient/rooms/\(safe)")
+            .appendingPathExtension("json")
+    }
+}
+
+// MARK: - Element export decode helpers
+
+private struct _ElementExportEvent: Codable {
+    let eventId: String
+    let sender: String
+    let originServerTs: Int64
+    let type: String
+    let content: _ElementExportContent
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case sender
+        case originServerTs = "origin_server_ts"
+        case type
+        case content
+    }
+}
+
+private struct _ElementExportContent: Codable {
+    let body: String?
+    let formattedBody: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case body
+        case formattedBody = "formatted_body"
+    }
+}
+
+// MARK: - TimelineItem → CachedMessage
+
+private extension TimelineItem {
+    func toCachedMessage() -> RoomVM.CachedMessage? {
+        guard let event = asEvent(),
+              case .eventId(let eventId) = event.eventOrTransactionId,
+              case .msgLike(let content) = event.content,
+              case .message(let msg) = content.kind else { return nil }
+
+        let body: String
+        let html: String?
+        if case .text(let t) = msg.msgType {
+            body = t.body
+            html = t.formatted?.body
+        } else if case .notice(let n) = msg.msgType {
+            body = n.body
+            html = n.formatted?.body
+        } else if case .emote(let e) = msg.msgType {
+            body = "* \(e.body)"
+            html = nil
+        } else {
+            body = msg.body
+            html = nil
+        }
+
+        return RoomVM.CachedMessage(
+            id: eventId,
+            sender: event.sender,
+            timestamp: Int64(event.timestamp),
+            body: body,
+            formattedBody: html,
+            isImported: false
+        )
+    }
 }

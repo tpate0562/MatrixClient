@@ -91,13 +91,13 @@ struct RoomDetailView: View {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button("Import from Element…") { showImportPicker = true }
-                    if !room.importedEvents.isEmpty {
+                    if room.cachedMessages.contains(where: \.isImported) {
                         Button("Clear Imported History", role: .destructive) { room.clearImport() }
                     }
                 } label: {
-                    Label("Import", systemImage: room.importedEvents.isEmpty
-                          ? "square.and.arrow.down"
-                          : "square.and.arrow.down.fill")
+                    Label("Import", systemImage: room.cachedMessages.contains(where: \.isImported)
+                          ? "square.and.arrow.down.fill"
+                          : "square.and.arrow.down")
                 }
                 .help("Import exported chat history")
             }
@@ -285,12 +285,13 @@ struct RoomDetailView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if !room.importedEvents.isEmpty {
-                        ForEach(room.importedEvents) { event in
-                            ImportedEventRow(event: event, members: room.members)
+                    let historical = historicalMessages
+                    if !historical.isEmpty {
+                        ForEach(historical) { msg in
+                            CachedMessageRow(message: msg, members: room.members)
                                 .padding(.top, 8)
                         }
-                        importedSeparator
+                        historicalSeparator(historical)
                     }
                     paginationHeader
                     // Use the item's stable unique ID (not the array index) so SwiftUI
@@ -412,15 +413,33 @@ struct RoomDetailView: View {
         }
     }
 
+    /// Cached messages that aren't yet represented in the live SDK `items`.
+    private var historicalMessages: [RoomVM.CachedMessage] {
+        let liveIds = Set(room.items.compactMap { item -> String? in
+            guard let event = item.asEvent(),
+                  case .eventId(let eid) = event.eventOrTransactionId else { return nil }
+            return eid
+        })
+        return room.cachedMessages.filter { !liveIds.contains($0.id) }
+    }
+
     @ViewBuilder
-    private var importedSeparator: some View {
+    private func historicalSeparator(_ msgs: [RoomVM.CachedMessage]) -> some View {
+        let importedCount = msgs.filter(\.isImported).count
+        let cachedCount = msgs.count - importedCount
+        let icon = importedCount > 0 ? "archivebox" : "internaldrive"
+        let label: String = {
+            switch (importedCount > 0, cachedCount > 0) {
+            case (true, true):   return "\(importedCount) imported · \(cachedCount) cached"
+            case (true, false):  return "\(importedCount) imported messages"
+            default:             return "\(cachedCount) cached messages"
+            }
+        }()
         HStack(spacing: 8) {
             VStack { Divider() }
             HStack(spacing: 4) {
-                Image(systemName: "archivebox")
-                    .font(.caption2)
-                Text("\(room.importedEvents.count) imported messages")
-                    .font(.caption2)
+                Image(systemName: icon).font(.caption2)
+                Text(label).font(.caption2)
             }
             .foregroundStyle(.tertiary)
             .fixedSize()
@@ -515,8 +534,8 @@ struct NicknameTarget: Identifiable {
     var id: String { userId }
 }
 
-private struct ImportedEventRow: View {
-    let event: RoomVM.ImportedEvent
+private struct CachedMessageRow: View {
+    let message: RoomVM.CachedMessage
     let members: [String: RoomMember]
 
     private static let timeFormatter: DateFormatter = {
@@ -527,28 +546,29 @@ private struct ImportedEventRow: View {
     }()
 
     private var senderName: String {
-        if let name = members[event.sender]?.displayName { return name }
-        // Fall back to the localpart of the MXID
-        return String(event.sender.split(separator: ":").first?.dropFirst() ?? Substring(event.sender))
+        if let name = members[message.sender]?.displayName { return name }
+        return String(message.sender.split(separator: ":").first?.dropFirst() ?? Substring(message.sender))
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            Avatar(name: senderName, mxc: members[event.sender]?.avatarUrl, size: 28)
+            Avatar(name: senderName, mxc: members[message.sender]?.avatarUrl, size: 28)
                 .opacity(0.7)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(senderName)
                         .font(.caption.bold())
                         .foregroundStyle(.secondary)
-                    Text(Self.timeFormatter.string(from: event.date))
+                    Text(Self.timeFormatter.string(from: message.date))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                    Image(systemName: "archivebox")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    if message.isImported {
+                        Image(systemName: "archivebox")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
-                Text(event.content.body ?? "")
+                Text(message.body)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
