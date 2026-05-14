@@ -103,7 +103,6 @@ final class RoomVM: ObservableObject, Identifiable {
     /// Open a live timeline + room-info + typing listeners. Idempotent — calling twice is a no-op.
     func openTimeline() async {
         guard timeline == nil else { return }
-        print("[Timeline:\(id.prefix(8))] openTimeline room=\(displayName.prefix(20))")
         do {
             let t = try await room.timeline()
             self.timeline = t
@@ -206,53 +205,30 @@ final class RoomVM: ObservableObject, Identifiable {
     /// in the background so the UI stays interactive. Idempotent — already-running task
     /// is reused.
     func startAutoPaginate() {
-        guard autoPaginateTask == nil else {
-            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, task already running")
-            return
-        }
-        guard timeline != nil else {
-            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, no timeline")
-            return
-        }
-        guard canPaginate else {
-            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, canPaginate=false")
-            return
-        }
-        print("[Pagination:\(id.prefix(8))] startAutoPaginate – starting (items=\(items.count))")
+        guard autoPaginateTask == nil else { return }
+        guard timeline != nil, canPaginate else { return }
         autoPaginateTask = Task { [weak self] in
-            var page = 0
             while let self, await !Task.isCancelled {
                 let shouldContinue = await MainActor.run { self.canPaginate && self.timeline != nil }
                 if !shouldContinue { break }
                 await MainActor.run { self.paginating = true }
                 let more: Bool
                 do {
-                    guard let t = await self.timelineHandleSafe else {
-                        print("[Pagination:\(await self.id.prefix(8))] no timeline handle – stopping")
-                        break
-                    }
+                    guard let t = await self.timelineHandleSafe else { break }
                     more = try await t.paginateBackwards(numEvents: 100)
-                    page += 1
-                    let count = await MainActor.run { self.items.count }
-                    print("[Pagination:\(await self.id.prefix(8))] page \(page) – more=\(more) items=\(count)")
                 } catch {
-                    print("[Pagination:\(await self.id.prefix(8))] ERROR page \(page): \(error)")
                     await MainActor.run {
                         self.session?.lastError = describe(error)
                         self.paginating = false
                     }
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    continue
+                    break
                 }
                 await MainActor.run {
                     self.canPaginate = more
                     self.paginating = false
                 }
-                if !more {
-                    let count = await MainActor.run { self.items.count }
-                    print("[Pagination:\(await self.id.prefix(8))] reached start of history after \(page) pages, \(count) total items")
-                    break
-                }
+                if !more { break }
+                // Yield briefly so we don't hog the network or the main thread.
                 try? await Task.sleep(nanoseconds: 5_000_000)
             }
             await MainActor.run {
@@ -283,57 +259,42 @@ final class RoomVM: ObservableObject, Identifiable {
 
     private func applyDiffs(_ diffs: [TimelineDiff]) {
         for diff in diffs {
-            let tag = "[Diff:\(id.prefix(8))]"
             switch diff {
             case .append(let values):
-                print("\(tag) .append \(values.count) items (sdk=\(sdkItems.count))")
                 sdkItems.append(contentsOf: values)
             case .clear:
-                print("\(tag) .clear (sdk=\(sdkItems.count) hist=\(historicalItems.count))")
-                // Before clearing, save our current items to the offline archive so they don't disappear from the UI
                 for item in items {
                     if !historicalItems.contains(where: { $0.uniqueId().id == item.uniqueId().id }) {
                         historicalItems.append(item)
                     }
                 }
                 sdkItems.removeAll()
-                // When sliding sync clears the timeline (e.g. connection reset),
-                // we must trigger pagination again to refill history.
                 canPaginate = true
                 autoPaginateTask?.cancel()
                 autoPaginateTask = nil
                 startAutoPaginate()
             case .pushFront(let value):
-                _ = value
                 sdkItems.insert(value, at: 0)
             case .pushBack(let value):
-                _ = value
                 sdkItems.append(value)
             case .popFront:
-                print("\(tag) .popFront (sdk=\(sdkItems.count))")
                 if !sdkItems.isEmpty { sdkItems.removeFirst() }
             case .popBack:
-                print("\(tag) .popBack (sdk=\(sdkItems.count))")
                 if !sdkItems.isEmpty { sdkItems.removeLast() }
             case .insert(let index, let value):
-                _ = value
                 let i = min(Int(index), sdkItems.count)
                 sdkItems.insert(value, at: i)
             case .set(let index, let value):
-                _ = value
                 let i = Int(index)
                 if i < sdkItems.count { sdkItems[i] = value } else { sdkItems.append(value) }
             case .remove(let index):
-                print("\(tag) .remove[\(index)] (sdk=\(sdkItems.count))")
                 let i = Int(index)
                 if i < sdkItems.count { sdkItems.remove(at: i) }
             case .truncate(let length):
-                print("\(tag) .truncate(\(length)) sdk was \(sdkItems.count)")
                 if sdkItems.count > Int(length) {
                     sdkItems.removeLast(sdkItems.count - Int(length))
                 }
             case .reset(let values):
-                print("\(tag) .reset to \(values.count) items (was sdk=\(sdkItems.count) hist=\(historicalItems.count))")
                 for item in sdkItems {
                     if !historicalItems.contains(where: { $0.uniqueId().id == item.uniqueId().id }) {
                         historicalItems.append(item)

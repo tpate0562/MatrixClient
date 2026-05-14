@@ -63,8 +63,9 @@ final class MatrixSession: ObservableObject {
             .backupDownloadStrategy(backupDownloadStrategy: .afterDecryptionFailure)
             .enableShareHistoryOnInvite(enableShareHistoryOnInvite: true)
             .autoEnableBackups(autoEnableBackups: true)
-            .roomKeyRecipientStrategy(strategy: .errorOnVerifiedUserProblem)
+            .roomKeyRecipientStrategy(strategy: .identityBasedStrategy)
             .decryptionSettings(decryptionSettings: DecryptionSettings(senderDeviceTrustRequirement: .untrusted))
+            .setSessionDelegate(sessionDelegate: SessionDelegateBox())
             .serverNameOrHomeserverUrl(serverNameOrUrl: input.trimmingCharacters(in: .whitespaces))
         return try await builder.build()
     }
@@ -251,7 +252,7 @@ final class MatrixSession: ObservableObject {
         // SAS verification controller. Other devices can initiate verification of this
         // device, and we can initiate verification of ourselves from another device.
         if let ctrl = try? await client.getSessionVerificationController() {
-            self.verification = VerificationController(controller: ctrl)
+            self.verification = VerificationController(controller: ctrl, encryption: client.encryption())
         }
 
         // Kick off background pagination so every joined room ends up with full history
@@ -294,9 +295,9 @@ final class MatrixSession: ObservableObject {
                         var more = true
                         var pages = 0
                         while more && pages < 200 && !Task.isCancelled {
-                            more = (try? await timeline.paginateBackwards(numEvents: 100)) ?? false
+                            more = (try? await timeline.paginateBackwards(numEvents: 500)) ?? false
                             pages += 1
-                            try? await Task.sleep(nanoseconds: 100_000_000)
+                            try? await Task.sleep(nanoseconds: 10_000_000)
                         }
                     } catch {
                         // Skip rooms we can't paginate; e.g. just-joined ones.
@@ -555,6 +556,24 @@ final class RoomListListener: RoomListEntriesListener, @unchecked Sendable {
     let cb: @Sendable ([RoomListEntriesUpdate]) -> Void
     init(_ cb: @escaping @Sendable ([RoomListEntriesUpdate]) -> Void) { self.cb = cb }
     func onUpdate(roomEntriesUpdate: [RoomListEntriesUpdate]) { cb(roomEntriesUpdate) }
+}
+
+// MARK: - Session delegate (token refresh persistence)
+
+/// Called by the SDK when it refreshes the access/refresh token pair (OIDC).
+/// Without this, a refreshed token is never persisted and the next app launch
+/// restores the stale one, causing "invalid_grant" failures.
+final class SessionDelegateBox: ClientSessionDelegate, @unchecked Sendable {
+    func saveSessionInKeychain(session: Session) {
+        KeychainStore.save(session)
+    }
+
+    func retrieveSessionFromKeychain(userId: String) throws -> Session {
+        guard let session = KeychainStore.load(), session.userId == userId else {
+            throw SimpleError("No keychain session for \(userId)")
+        }
+        return session
+    }
 }
 
 // MARK: - Tiny error type for our own paths
