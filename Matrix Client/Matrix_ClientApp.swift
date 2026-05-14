@@ -14,7 +14,7 @@ struct Matrix_ClientApp: App {
             logLevel: .error,
             traceLogPacks: [],
             extraTargets: [],
-            writeToStdoutOrSystem: false,
+            writeToStdoutOrSystem: true,
             writeToFiles: nil,
             sentryConfig: nil
         )

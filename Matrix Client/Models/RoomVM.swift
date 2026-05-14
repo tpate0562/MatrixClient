@@ -249,8 +249,20 @@ final class RoomVM: ObservableObject, Identifiable {
                     self.paginating = false
                 }
                 if !more {
+                    let summary = await MainActor.run { () -> String in
+                        self.items.map { item -> String in
+                            if let ev = item.asEvent() {
+                                if case .msgLike(let c) = ev.content, case .message(let m) = c.kind {
+                                    return "msg(\(m.msgType))"
+                                }
+                                return "event(\(ev.content))"
+                            }
+                            return "virtual"
+                        }.joined(separator: " | ")
+                    }
                     let count = await MainActor.run { self.items.count }
                     print("[Pagination:\(roomId)] reached start of history after \(page) pages, \(count) total items")
+                    print("[Pagination:\(roomId)] item breakdown: \(summary)")
                     break
                 }
                 // Yield briefly so we don't hog the network or the main thread.
