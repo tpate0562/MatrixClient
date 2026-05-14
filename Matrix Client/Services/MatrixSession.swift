@@ -267,6 +267,28 @@ final class MatrixSession: ObservableObject {
         invites = [:]
     }
 
+    /// Wipe the SDK's SQLite event cache and crypto store, then immediately restore the
+    /// session from keychain. The user stays logged in; the SDK re-fetches room history
+    /// from the server on next sync. Use this when pagination returns stale "fully-loaded"
+    /// state from a previous session's bad sweep.
+    func resetSdkStore() async {
+        guard let saved = KeychainStore.load() else { return }
+        try? await stop()
+        // Wipe data + cache paths (SQLite, event cache, crypto keys).
+        let _ = try? sessionPaths(wipe: true)
+        rooms = [:]
+        roomOrder = []
+        invites = [:]
+        // Rebuild the client from scratch with the same session — no re-auth needed.
+        do {
+            let freshClient = try await makeClient(homeserverUrlOrServerName: saved.homeserverUrl, freshStart: true)
+            try await freshClient.restoreSession(session: saved)
+            try await activate(client: freshClient, session: saved)
+        } catch {
+            lastError = "Store reset failed: \(describe(error))"
+        }
+    }
+
     private func stop() async throws {
         syncStateHandle = nil
         recoveryStateHandle = nil

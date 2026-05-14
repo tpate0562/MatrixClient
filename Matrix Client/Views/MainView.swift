@@ -33,6 +33,10 @@ struct MainView: View {
                             if session.recoveryState != .enabled {
                                 Button("Recover Encryption Keys…") { showRecovery = true }
                             }
+                            Divider()
+                            Button("Reset sync cache…") {
+                                Task { await session.resetSdkStore() }
+                            }
                         } label: {
                             Label("New", systemImage: "square.and.pencil")
                         }
