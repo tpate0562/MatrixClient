@@ -10,12 +10,11 @@ struct Matrix_ClientApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
-        // Enable Rust SDK tracing so we can see verification cancel reasons
         let config = TracingConfiguration(
-            logLevel: .warn,
+            logLevel: .error,
             traceLogPacks: [],
             extraTargets: [],
-            writeToStdoutOrSystem: true,
+            writeToStdoutOrSystem: false,
             writeToFiles: nil,
             sentryConfig: nil
         )
