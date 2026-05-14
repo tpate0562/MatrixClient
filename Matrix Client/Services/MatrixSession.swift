@@ -23,11 +23,7 @@ final class MatrixSession: ObservableObject {
     private var recoveryStateHandle: TaskHandle?
     private var verificationStateHandle: TaskHandle?
     private var listenerBox: RoomListListener?
-    private var backgroundSweepTask: Task<Void, Never>?
-    private var sweptRoomIds: Set<String> = []
     @Published private(set) var verificationState: VerificationState = .unknown
-    @Published private(set) var sweepActive: Bool = false
-    @Published private(set) var sweepProgress: (current: Int, total: Int) = (0, 0)
     @Published private(set) var verification: VerificationController?
 
     var currentUserId: String? { session?.userId }
@@ -255,61 +251,6 @@ final class MatrixSession: ObservableObject {
             self.verification = VerificationController(controller: ctrl, encryption: client.encryption())
         }
 
-        // Kick off background pagination so every joined room ends up with full history
-        // in the SDK's SQLite cache.
-        startBackgroundSweep()
-    }
-
-    /// Walk through every joined room in the background and paginate it to exhaustion.
-    /// Processes one room at a time so we don't hammer the server, and remembers which
-    /// rooms have already been swept for this session.
-    func startBackgroundSweep() {
-        if let t = backgroundSweepTask, !t.isCancelled { return }
-        guard let roomListService else { return }
-        backgroundSweepTask = Task { [weak self, roomListService] in
-            // Soft delay so initial sync settles before we start hammering.
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            while let self, !Task.isCancelled {
-                let pending = await MainActor.run {
-                    self.roomOrder.filter { !self.sweptRoomIds.contains($0) }
-                }
-                if pending.isEmpty {
-                    await MainActor.run {
-                        self.sweepActive = false
-                        self.sweepProgress = (0, 0)
-                    }
-                    break
-                }
-                await MainActor.run {
-                    self.sweepActive = true
-                    self.sweepProgress = (
-                        self.roomOrder.count - pending.count,
-                        self.roomOrder.count
-                    )
-                }
-                for roomId in pending {
-                    if Task.isCancelled { break }
-                    do {
-                        let sdkRoom = try roomListService.room(roomId: roomId)
-                        let timeline = try await sdkRoom.timeline()
-                        var more = true
-                        var pages = 0
-                        while more && pages < 200 && !Task.isCancelled {
-                            more = (try? await timeline.paginateBackwards(numEvents: 500)) ?? false
-                            pages += 1
-                            try? await Task.sleep(nanoseconds: 10_000_000)
-                        }
-                    } catch {
-                        // Skip rooms we can't paginate; e.g. just-joined ones.
-                    }
-                    await MainActor.run {
-                        self.sweptRoomIds.insert(roomId)
-                        let done = self.sweptRoomIds.intersection(Set(self.roomOrder)).count
-                        self.sweepProgress = (done, self.roomOrder.count)
-                    }
-                }
-            }
-        }
     }
 
     func logout() async {
@@ -327,8 +268,6 @@ final class MatrixSession: ObservableObject {
     }
 
     private func stop() async throws {
-        backgroundSweepTask?.cancel()
-        backgroundSweepTask = nil
         syncStateHandle = nil
         recoveryStateHandle = nil
         verificationStateHandle = nil
@@ -336,9 +275,6 @@ final class MatrixSession: ObservableObject {
         entriesResult = nil
         listenerBox = nil
         verification = nil
-        sweptRoomIds = []
-        sweepActive = false
-        sweepProgress = (0, 0)
         await syncService?.stop()
         syncService = nil
         roomListService = nil

@@ -126,13 +126,6 @@ private struct EmptyDetailView: View {
                 stateDot
                 Text(stateLabel).foregroundStyle(.tertiary)
             }
-            if session.sweepActive, session.sweepProgress.total > 0 {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading history \(session.sweepProgress.current) / \(session.sweepProgress.total) rooms")
-                        .font(.caption).foregroundStyle(.tertiary)
-                }
-            }
             HStack(spacing: 6) {
                 verificationDot
                 Text(verificationLabel).font(.caption).foregroundStyle(.tertiary)
