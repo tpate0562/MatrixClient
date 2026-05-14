@@ -1,5 +1,6 @@
 import SwiftUI
 import MatrixRustSDK
+import UniformTypeIdentifiers
 
 private enum SearchMode: String, CaseIterable {
     case exact = "Exact"
@@ -45,6 +46,7 @@ struct RoomDetailView: View {
     @State private var searchQuery = ""
     @State private var searchMode: SearchMode = .exact
     @State private var isAtBottom: Bool = true
+    @State private var showImportPicker = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -87,6 +89,19 @@ struct RoomDetailView: View {
                 .help("Pinned messages (⌘P)")
             }
             ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button("Import from Element…") { showImportPicker = true }
+                    if !room.importedEvents.isEmpty {
+                        Button("Clear Imported History", role: .destructive) { room.clearImport() }
+                    }
+                } label: {
+                    Label("Import", systemImage: room.importedEvents.isEmpty
+                          ? "square.and.arrow.down"
+                          : "square.and.arrow.down.fill")
+                }
+                .help("Import exported chat history")
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button { showAdmin = true } label: {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -123,6 +138,13 @@ struct RoomDetailView: View {
         }
         .sheet(item: $nicknameTarget) { target in
             NicknameEditor(userId: target.userId, currentName: target.fallbackName)
+        }
+        .fileImporter(
+            isPresented: $showImportPicker,
+            allowedContentTypes: [.json],
+            allowsMultipleSelection: true
+        ) { result in
+            if case .success(let urls) = result { room.loadImport(from: urls) }
         }
         .task(id: room.id) {
             await room.openTimeline()
@@ -263,6 +285,13 @@ struct RoomDetailView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    if !room.importedEvents.isEmpty {
+                        ForEach(room.importedEvents) { event in
+                            ImportedEventRow(event: event, members: room.members)
+                                .padding(.top, 8)
+                        }
+                        importedSeparator
+                    }
                     paginationHeader
                     // Use the item's stable unique ID (not the array index) so SwiftUI
                     // treats prepended history items as insertions rather than replacements.
@@ -384,6 +413,22 @@ struct RoomDetailView: View {
     }
 
     @ViewBuilder
+    private var importedSeparator: some View {
+        HStack(spacing: 8) {
+            VStack { Divider() }
+            HStack(spacing: 4) {
+                Image(systemName: "archivebox")
+                    .font(.caption2)
+                Text("\(room.importedEvents.count) imported messages")
+                    .font(.caption2)
+            }
+            .foregroundStyle(.tertiary)
+            .fixedSize()
+            VStack { Divider() }
+        }
+        .padding(.vertical, 4)
+    }
+
     private var paginationHeader: some View {
         HStack {
             Spacer()
@@ -468,4 +513,47 @@ struct NicknameTarget: Identifiable {
     let userId: String
     let fallbackName: String
     var id: String { userId }
+}
+
+private struct ImportedEventRow: View {
+    let event: RoomVM.ImportedEvent
+    let members: [String: RoomMember]
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .short
+        f.timeStyle = .short
+        return f
+    }()
+
+    private var senderName: String {
+        if let name = members[event.sender]?.displayName { return name }
+        // Fall back to the localpart of the MXID
+        return String(event.sender.split(separator: ":").first?.dropFirst() ?? Substring(event.sender))
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Avatar(name: senderName, mxc: members[event.sender]?.avatarUrl, size: 28)
+                .opacity(0.7)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(senderName)
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Text(Self.timeFormatter.string(from: event.date))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Image(systemName: "archivebox")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Text(event.content.body ?? "")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 0)
+        }
+    }
 }

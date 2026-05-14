@@ -812,6 +812,64 @@ final class RoomVM: ObservableObject, Identifiable {
         do { try await room.leave() } catch { session?.lastError = describe(error) }
     }
 
+    // MARK: - Element JSON import
+
+    struct ImportedEvent: Identifiable, Codable {
+        let eventId: String
+        let sender: String
+        let originServerTs: Int64
+        let type: String
+        let content: ImportedEventContent
+
+        var id: String { eventId }
+        var date: Date { Date(timeIntervalSince1970: Double(originServerTs) / 1000) }
+
+        private enum CodingKeys: String, CodingKey {
+            case eventId = "event_id"
+            case sender
+            case originServerTs = "origin_server_ts"
+            case type
+            case content
+        }
+    }
+
+    struct ImportedEventContent: Codable {
+        let msgtype: String?
+        let body: String?
+        let formattedBody: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case msgtype
+            case body
+            case formattedBody = "formatted_body"
+        }
+    }
+
+    @Published var importedEvents: [ImportedEvent] = []
+
+    /// Parses one or more Element JSON export files and prepends their events (deduped,
+    /// oldest-first) to `importedEvents`. Only `m.room.message` events are kept.
+    func loadImport(from urls: [URL]) {
+        var merged: [String: ImportedEvent] = Dictionary(
+            uniqueKeysWithValues: importedEvents.map { ($0.eventId, $0) }
+        )
+        let decoder = JSONDecoder()
+        for url in urls {
+            _ = url.startAccessingSecurityScopedResource()
+            defer { url.stopAccessingSecurityScopedResource() }
+            guard let data = try? Data(contentsOf: url),
+                  let events = try? decoder.decode([ImportedEvent].self, from: data) else { continue }
+            for event in events where event.type == "m.room.message" {
+                merged[event.eventId] = event
+            }
+        }
+        importedEvents = merged.values.sorted { $0.originServerTs < $1.originServerTs }
+    }
+
+    func clearImport() {
+        importedEvents = []
+    }
+
     // MARK: - Convenience
 
     var heroName: String {
