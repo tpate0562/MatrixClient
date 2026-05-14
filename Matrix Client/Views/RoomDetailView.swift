@@ -190,7 +190,7 @@ struct RoomDetailView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if searchResults.isEmpty {
-                    Text("No results for "\(searchQuery)"")
+                    Text("No results for \"\(searchQuery)\"")
                         .font(.callout).foregroundStyle(.secondary)
                         .padding().frame(maxWidth: .infinity)
                 } else {
