@@ -42,6 +42,13 @@ final class RoomVM: ObservableObject, Identifiable {
     private var listenerBox: AnyObject?
     private var autoPaginateTask: Task<Void, Never>?
 
+    // Bridge timeline: used to continue history past the sliding-sync prev_batch wall
+    // by anchoring at the oldest known event and using the /context API token chain.
+    private var bridgeTimeline: Timeline?
+    private var bridgeHandle: TaskHandle?
+    private var bridgeBox: AnyObject?
+    private var bridgeItems: [TimelineItem] = []
+
     // Long-lived pinned-events timeline. We mirror its event IDs into
     // `pinnedEventIds` so the inline pin indicator updates immediately, even
     // when RoomInfo's pinnedEventIds list is slow to refresh after a pin.
@@ -82,6 +89,10 @@ final class RoomVM: ObservableObject, Identifiable {
         typingHandle = nil
         listenerBox = nil
         timeline = nil
+        bridgeHandle = nil
+        bridgeBox = nil
+        bridgeTimeline = nil
+        bridgeItems = []
         pinnedIndexHandle = nil
         pinnedIndexBox = nil
         pinnedIndexTimeline = nil
@@ -249,20 +260,9 @@ final class RoomVM: ObservableObject, Identifiable {
                     self.paginating = false
                 }
                 if !more {
-                    let summary = await MainActor.run { () -> String in
-                        self.items.map { item -> String in
-                            if let ev = item.asEvent() {
-                                if case .msgLike(let c) = ev.content, case .message(let m) = c.kind {
-                                    return "msg(\(m.msgType))"
-                                }
-                                return "event(\(ev.content))"
-                            }
-                            return "virtual"
-                        }.joined(separator: " | ")
-                    }
                     let count = await MainActor.run { self.items.count }
-                    print("[Pagination:\(roomId)] reached start of history after \(page) pages, \(count) total items")
-                    print("[Pagination:\(roomId)] item breakdown: \(summary)")
+                    print("[Pagination:\(roomId)] reached sync wall after \(page) pages, \(count) items — trying context bridge")
+                    await self.runBridgePagination(roomId: roomId)
                     break
                 }
                 // Yield briefly so we don't hog the network or the main thread.
@@ -277,6 +277,105 @@ final class RoomVM: ObservableObject, Identifiable {
 
     /// Background-safe accessor for the timeline handle.
     private var timelineHandleSafe: Timeline? { timeline }
+
+    /// Opens a focused timeline anchored at the oldest known event, which uses the
+    /// server's /context API for its initial token — a different chain than the
+    /// sliding-sync prev_batch. This bridges pagination gaps where the sync wall
+    /// stops before the room's true start.
+    private func runBridgePagination(roomId: String) async {
+        let anchor = await MainActor.run { () -> String? in
+            items.compactMap { item -> String? in
+                guard let ev = item.asEvent() else { return nil }
+                if case .eventId(let eid) = ev.eventOrTransactionId { return eid }
+                return nil
+            }.first
+        }
+        guard let anchor else {
+            print("[Pagination:\(roomId)] bridge – no anchor event, skipping")
+            return
+        }
+        print("[Pagination:\(roomId)] bridge – anchor=\(anchor.prefix(16))")
+        let config = TimelineConfiguration(
+            focus: .event(eventId: anchor, numContextEvents: 20,
+                          threadMode: .automatic(hideThreadedEvents: false)),
+            filter: .all,
+            internalIdPrefix: "bridge-\(id.prefix(8))",
+            dateDividerMode: .daily,
+            trackReadReceipts: .disabled,
+            reportUtds: false
+        )
+        do {
+            let t = try await room.timelineWithConfiguration(configuration: config)
+            await MainActor.run { self.bridgeTimeline = t }
+            let listener = TimelineListenerBox { [weak self] diffs in
+                Task { @MainActor in self?.applyBridgeDiffs(diffs) }
+            }
+            await MainActor.run { self.bridgeBox = listener }
+            let handle = await t.addListener(listener: listener)
+            await MainActor.run { self.bridgeHandle = handle }
+
+            // Let the initial /context items arrive.
+            try? await Task.sleep(nanoseconds: 300_000_000)
+
+            var more = true
+            var page = 0
+            while more && page < 200 && !Task.isCancelled {
+                more = (try? await t.paginateBackwards(numEvents: 100)) ?? false
+                page += 1
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                let count = await MainActor.run { self.bridgeItems.count }
+                print("[Pagination:\(roomId)] bridge page \(page) – more=\(more) bridgeItems=\(count)")
+                if !more { break }
+            }
+
+            // Merge items that aren't already in our timeline.
+            await MainActor.run {
+                for item in self.bridgeItems {
+                    let uid = item.uniqueId().id
+                    guard !self.historicalItems.contains(where: { $0.uniqueId().id == uid }) else { continue }
+                    guard !self.sdkItems.contains(where: { $0.uniqueId().id == uid }) else { continue }
+                    self.historicalItems.append(item)
+                }
+                var merged = self.historicalItems
+                merged.removeAll { h in self.sdkItems.contains { $0.uniqueId().id == h.uniqueId().id } }
+                merged.append(contentsOf: self.sdkItems)
+                self.items = merged
+            }
+            let final = await MainActor.run { self.items.count }
+            print("[Pagination:\(roomId)] bridge – done, total items now \(final)")
+        } catch {
+            print("[Pagination:\(roomId)] bridge – error: \(error)")
+        }
+        await MainActor.run {
+            self.bridgeHandle = nil
+            self.bridgeBox = nil
+            self.bridgeTimeline = nil
+            self.bridgeItems = []
+        }
+    }
+
+    private func applyBridgeDiffs(_ diffs: [TimelineDiff]) {
+        for diff in diffs {
+            switch diff {
+            case .reset(let v):            bridgeItems = v
+            case .append(let v):           bridgeItems.append(contentsOf: v)
+            case .pushBack(let v):         bridgeItems.append(v)
+            case .pushFront(let v):        bridgeItems.insert(v, at: 0)
+            case .insert(let i, let v):    bridgeItems.insert(v, at: min(Int(i), bridgeItems.count))
+            case .set(let i, let v):
+                let idx = Int(i)
+                if idx < bridgeItems.count { bridgeItems[idx] = v } else { bridgeItems.append(v) }
+            case .remove(let i):
+                let idx = Int(i)
+                if idx < bridgeItems.count { bridgeItems.remove(at: idx) }
+            case .truncate(let l):
+                if bridgeItems.count > Int(l) { bridgeItems.removeLast(bridgeItems.count - Int(l)) }
+            case .clear:   bridgeItems = []
+            case .popFront: if !bridgeItems.isEmpty { bridgeItems.removeFirst() }
+            case .popBack:  if !bridgeItems.isEmpty { bridgeItems.removeLast() }
+            }
+        }
+    }
 
     private func apply(info: RoomInfo) {
         displayName = info.displayName ?? id
