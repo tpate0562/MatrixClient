@@ -44,6 +44,7 @@ struct RoomDetailView: View {
     @State private var showSearch = false
     @State private var searchQuery = ""
     @State private var searchMode: SearchMode = .exact
+    @State private var isAtBottom: Bool = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -263,8 +264,15 @@ struct RoomDetailView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     paginationHeader
-                    ForEach(room.items.indices, id: \.self) { idx in
-                        let item = room.items[idx]
+                    // Use the item's stable unique ID (not the array index) so SwiftUI
+                    // treats prepended history items as insertions rather than replacements.
+                    // Using indices as IDs causes every visible row to be considered
+                    // "changed" when pagination adds items at the front, wrecking scroll position.
+                    let rows = room.items.enumerated().map {
+                        (uid: $0.element.uniqueId().id, idx: $0.offset, item: $0.element)
+                    }
+                    ForEach(rows, id: \.uid) { row in
+                        let idx = row.idx; let item = row.item
                         let grouped = isGroupContinuation(at: idx)
                         TimelineRow(
                             item: item,
@@ -291,13 +299,20 @@ struct RoomDetailView: View {
                         .padding(.top, grouped ? 1 : 8)
                     }
                     Color.clear.frame(height: 1).id("__bottom__")
+                        .onAppear { isAtBottom = true }
+                        .onDisappear { isAtBottom = false }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
             .onChange(of: room.items.last?.uniqueId().id) {
-                // Only scroll to the bottom when a new message arrives at the tail.
-                // Pagination prepends older items, so the last item ID stays the same — skip those.
-                withAnimation { proxy.scrollTo("__bottom__", anchor: .bottom) }
+                // Only auto-scroll when a new message arrives at the tail AND the user
+                // is already at the bottom. When the user has scrolled up to read history
+                // we don't want to yank them back down.
+                if isAtBottom {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("__bottom__", anchor: .bottom)
+                    }
+                }
             }
             .onAppear {
                 proxy.scrollTo("__bottom__", anchor: .bottom)
