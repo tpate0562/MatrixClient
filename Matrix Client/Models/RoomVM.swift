@@ -1,6 +1,8 @@
 import Foundation
 import Combine
 import MatrixRustSDK
+import UniformTypeIdentifiers
+import ImageIO
 
 /// Observable wrapper around a single SDK `Room`. Lazily attaches a Timeline listener +
 /// RoomInfo/typing listeners when the room is first opened.
@@ -25,6 +27,8 @@ final class RoomVM: ObservableObject, Identifiable {
 
     // Live state
     @Published var items: [TimelineItem] = []
+    private var sdkItems: [TimelineItem] = []
+    private var historicalItems: [TimelineItem] = []
     @Published var paginating: Bool = false
     @Published var canPaginate: Bool = true
     @Published var typingUserIds: Set<String> = []
@@ -83,11 +87,23 @@ final class RoomVM: ObservableObject, Identifiable {
         pinnedIndexTimeline = nil
     }
 
+    /// Force a complete reload of the timeline (useful if history seems out of sync or stuck).
+    func forceReload() async {
+        detach()
+        items.removeAll()
+        historicalItems.removeAll()
+        sdkItems.removeAll()
+        canPaginate = true
+        paginating = false
+        await openTimeline()
+    }
+
     // MARK: - Attach listeners
 
     /// Open a live timeline + room-info + typing listeners. Idempotent — calling twice is a no-op.
     func openTimeline() async {
         guard timeline == nil else { return }
+        print("[Timeline:\(id.prefix(8))] openTimeline room=\(displayName.prefix(20))")
         do {
             let t = try await room.timeline()
             self.timeline = t
@@ -190,33 +206,59 @@ final class RoomVM: ObservableObject, Identifiable {
     /// in the background so the UI stays interactive. Idempotent — already-running task
     /// is reused.
     func startAutoPaginate() {
-        if let t = autoPaginateTask, !t.isCancelled { return }
-        guard timeline != nil, canPaginate else { return }
+        guard autoPaginateTask == nil else {
+            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, task already running")
+            return
+        }
+        guard timeline != nil else {
+            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, no timeline")
+            return
+        }
+        guard canPaginate else {
+            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, canPaginate=false")
+            return
+        }
+        print("[Pagination:\(id.prefix(8))] startAutoPaginate – starting (items=\(items.count))")
         autoPaginateTask = Task { [weak self] in
+            var page = 0
             while let self, await !Task.isCancelled {
                 let shouldContinue = await MainActor.run { self.canPaginate && self.timeline != nil }
                 if !shouldContinue { break }
                 await MainActor.run { self.paginating = true }
                 let more: Bool
                 do {
-                    guard let t = await self.timelineHandleSafe else { break }
+                    guard let t = await self.timelineHandleSafe else {
+                        print("[Pagination:\(await self.id.prefix(8))] no timeline handle – stopping")
+                        break
+                    }
                     more = try await t.paginateBackwards(numEvents: 100)
+                    page += 1
+                    let count = await MainActor.run { self.items.count }
+                    print("[Pagination:\(await self.id.prefix(8))] page \(page) – more=\(more) items=\(count)")
                 } catch {
+                    print("[Pagination:\(await self.id.prefix(8))] ERROR page \(page): \(error)")
                     await MainActor.run {
                         self.session?.lastError = describe(error)
                         self.paginating = false
                     }
-                    break
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    continue
                 }
                 await MainActor.run {
                     self.canPaginate = more
                     self.paginating = false
                 }
-                if !more { break }
-                // Yield briefly so we don't hog the network or the main thread.
-                try? await Task.sleep(nanoseconds: 80_000_000)
+                if !more {
+                    let count = await MainActor.run { self.items.count }
+                    print("[Pagination:\(await self.id.prefix(8))] reached start of history after \(page) pages, \(count) total items")
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000)
             }
-            await MainActor.run { self?.paginating = false }
+            await MainActor.run {
+                self?.paginating = false
+                self?.autoPaginateTask = nil
+            }
         }
     }
 
@@ -241,36 +283,77 @@ final class RoomVM: ObservableObject, Identifiable {
 
     private func applyDiffs(_ diffs: [TimelineDiff]) {
         for diff in diffs {
+            let tag = "[Diff:\(id.prefix(8))]"
             switch diff {
             case .append(let values):
-                items.append(contentsOf: values)
+                print("\(tag) .append \(values.count) items (sdk=\(sdkItems.count))")
+                sdkItems.append(contentsOf: values)
             case .clear:
-                items.removeAll()
+                print("\(tag) .clear (sdk=\(sdkItems.count) hist=\(historicalItems.count))")
+                // Before clearing, save our current items to the offline archive so they don't disappear from the UI
+                for item in items {
+                    if !historicalItems.contains(where: { $0.uniqueId().id == item.uniqueId().id }) {
+                        historicalItems.append(item)
+                    }
+                }
+                sdkItems.removeAll()
+                // When sliding sync clears the timeline (e.g. connection reset),
+                // we must trigger pagination again to refill history.
+                canPaginate = true
+                autoPaginateTask?.cancel()
+                autoPaginateTask = nil
+                startAutoPaginate()
             case .pushFront(let value):
-                items.insert(value, at: 0)
+                _ = value
+                sdkItems.insert(value, at: 0)
             case .pushBack(let value):
-                items.append(value)
+                _ = value
+                sdkItems.append(value)
             case .popFront:
-                if !items.isEmpty { items.removeFirst() }
+                print("\(tag) .popFront (sdk=\(sdkItems.count))")
+                if !sdkItems.isEmpty { sdkItems.removeFirst() }
             case .popBack:
-                if !items.isEmpty { items.removeLast() }
+                print("\(tag) .popBack (sdk=\(sdkItems.count))")
+                if !sdkItems.isEmpty { sdkItems.removeLast() }
             case .insert(let index, let value):
-                let i = min(Int(index), items.count)
-                items.insert(value, at: i)
+                _ = value
+                let i = min(Int(index), sdkItems.count)
+                sdkItems.insert(value, at: i)
             case .set(let index, let value):
+                _ = value
                 let i = Int(index)
-                if i < items.count { items[i] = value } else { items.append(value) }
+                if i < sdkItems.count { sdkItems[i] = value } else { sdkItems.append(value) }
             case .remove(let index):
+                print("\(tag) .remove[\(index)] (sdk=\(sdkItems.count))")
                 let i = Int(index)
-                if i < items.count { items.remove(at: i) }
+                if i < sdkItems.count { sdkItems.remove(at: i) }
             case .truncate(let length):
-                if items.count > Int(length) {
-                    items.removeLast(items.count - Int(length))
+                print("\(tag) .truncate(\(length)) sdk was \(sdkItems.count)")
+                if sdkItems.count > Int(length) {
+                    sdkItems.removeLast(sdkItems.count - Int(length))
                 }
             case .reset(let values):
-                items = values
+                print("\(tag) .reset to \(values.count) items (was sdk=\(sdkItems.count) hist=\(historicalItems.count))")
+                for item in sdkItems {
+                    if !historicalItems.contains(where: { $0.uniqueId().id == item.uniqueId().id }) {
+                        historicalItems.append(item)
+                    }
+                }
+                sdkItems = values
+                canPaginate = true
+                autoPaginateTask?.cancel()
+                autoPaginateTask = nil
+                startAutoPaginate()
             }
         }
+        
+        // Rebuild public `items` to include both historical + live items without duplicates
+        var newItems = historicalItems
+        newItems.removeAll { histItem in
+            sdkItems.contains(where: { $0.uniqueId().id == histItem.uniqueId().id })
+        }
+        newItems.append(contentsOf: sdkItems)
+        items = newItems
     }
 
     // MARK: - Timeline actions
@@ -286,12 +369,20 @@ final class RoomVM: ObservableObject, Identifiable {
             let pair = MessageBuilder.spoiler(body)
             msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
         case .none:
-            // Plain markdown — SDK converts to HTML formatted_body automatically.
-            msg = messageEventContentFromMarkdown(md: text)
+            // Check for inline ||spoiler|| syntax (Discord-style)
+            if text.contains("||") {
+                let pair = MessageBuilder.inlineSpoilers(text)
+                msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+            } else {
+                // Plain markdown — SDK converts to HTML formatted_body automatically.
+                msg = messageEventContentFromMarkdown(md: text)
+            }
         }
         do {
             _ = try await timeline.send(msg: msg)
-        } catch { session?.lastError = describe(error) }
+        } catch {
+            session?.lastError = describe(error)
+        }
     }
 
     func sendReply(to eventId: String, text: String) async {
@@ -305,10 +396,38 @@ final class RoomVM: ObservableObject, Identifiable {
             let pair = MessageBuilder.spoiler(body)
             msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
         case .none:
-            msg = messageEventContentFromMarkdown(md: text)
+            if text.contains("||") {
+                let pair = MessageBuilder.inlineSpoilers(text)
+                msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+            } else {
+                msg = messageEventContentFromMarkdown(md: text)
+            }
         }
         do {
             try await timeline.sendReply(msg: msg, eventId: eventId)
+        } catch { session?.lastError = describe(error) }
+    }
+
+    func sendEdit(to eventId: String, text: String) async {
+        guard let timeline else { return }
+        let msg: RoomMessageEventContentWithoutRelation
+        switch SlashCommandParser.parse(text) {
+        case .rainbow(let body):
+            let pair = MessageBuilder.rainbow(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .spoiler(let body):
+            let pair = MessageBuilder.spoiler(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .none:
+            if text.contains("||") {
+                let pair = MessageBuilder.inlineSpoilers(text)
+                msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+            } else {
+                msg = messageEventContentFromMarkdown(md: text)
+            }
+        }
+        do {
+            try await timeline.edit(eventOrTransactionId: .eventId(eventId: eventId), newContent: .roomMessage(content: msg))
         } catch { session?.lastError = describe(error) }
     }
 
@@ -326,6 +445,133 @@ final class RoomVM: ObservableObject, Identifiable {
         // hand-built content with no relations.
         return (try? contentWithoutRelationFromMessage(message: content))
             ?? messageEventContentFromMarkdown(md: plain)
+    }
+
+    /// Send one or more files (images, videos, or generic files) from local URLs.
+    func sendAttachments(_ urls: [URL]) async {
+        for url in urls {
+            await sendAttachment(url)
+        }
+    }
+
+    /// Send a single file attachment. Reads the file into memory to avoid
+    /// security-scoped resource timing issues, then sends via the SDK.
+    func sendAttachment(_ url: URL) async {
+        guard let timeline else { return }
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
+        let filename = url.lastPathComponent
+        let mime = mimeType(for: url)
+
+        // Read file data into memory so the security-scoped resource doesn't
+        // expire before the SDK's background upload finishes.
+        guard let fileData = try? Data(contentsOf: url) else {
+            session?.lastError = "Failed to read file: \(filename)"
+            return
+        }
+
+        let params = UploadParameters(
+            source: .data(bytes: fileData, filename: filename),
+            caption: nil,
+            formattedCaption: nil,
+            mentions: nil,
+            inReplyTo: nil
+        )
+
+        do {
+            if mime.hasPrefix("image/") {
+                let info = imageInfo(for: url, mime: mime)
+                _ = try timeline.sendImage(params: params, thumbnailSource: nil, imageInfo: info)
+            } else if mime.hasPrefix("video/") {
+                let info = VideoInfo(
+                    duration: nil, height: nil, width: nil,
+                    mimetype: mime, size: UInt64(fileData.count),
+                    thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil
+                )
+                _ = try timeline.sendVideo(params: params, thumbnailSource: nil, videoInfo: info)
+            } else if mime.hasPrefix("audio/") {
+                let info = AudioInfo(duration: nil, size: UInt64(fileData.count), mimetype: mime)
+                _ = try timeline.sendAudio(params: params, audioInfo: info)
+            } else {
+                let info = FileInfo(
+                    mimetype: mime, size: UInt64(fileData.count),
+                    thumbnailInfo: nil, thumbnailSource: nil
+                )
+                _ = try timeline.sendFile(params: params, fileInfo: info)
+            }
+        } catch {
+            session?.lastError = describe(error)
+        }
+    }
+
+    /// Send raw data (e.g. from clipboard paste or drag-and-drop).
+    func sendData(_ data: Data, filename: String, mime: String) async {
+        guard let timeline else { return }
+        let params = UploadParameters(
+            source: .data(bytes: data, filename: filename),
+            caption: nil,
+            formattedCaption: nil,
+            mentions: nil,
+            inReplyTo: nil
+        )
+        do {
+            if mime.hasPrefix("image/") {
+                var info = ImageInfo(
+                    height: nil, width: nil, mimetype: mime, size: UInt64(data.count),
+                    thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil, isAnimated: nil
+                )
+                if let source = CGImageSourceCreateWithData(data as CFData, nil),
+                   let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
+                    info.width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.uint64Value
+                    info.height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.uint64Value
+                }
+                _ = try timeline.sendImage(params: params, thumbnailSource: nil, imageInfo: info)
+            } else if mime.hasPrefix("video/") {
+                let info = VideoInfo(
+                    duration: nil, height: nil, width: nil,
+                    mimetype: mime, size: UInt64(data.count),
+                    thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil
+                )
+                _ = try timeline.sendVideo(params: params, thumbnailSource: nil, videoInfo: info)
+            } else if mime.hasPrefix("audio/") {
+                let info = AudioInfo(duration: nil, size: UInt64(data.count), mimetype: mime)
+                _ = try timeline.sendAudio(params: params, audioInfo: info)
+            } else {
+                let info = FileInfo(
+                    mimetype: mime, size: UInt64(data.count),
+                    thumbnailInfo: nil, thumbnailSource: nil
+                )
+                _ = try timeline.sendFile(params: params, fileInfo: info)
+            }
+        } catch {
+            session?.lastError = describe(error)
+        }
+    }
+
+    private func mimeType(for url: URL) -> String {
+        if let uti = UTType(filenameExtension: url.pathExtension) {
+            return uti.preferredMIMEType ?? "application/octet-stream"
+        }
+        return "application/octet-stream"
+    }
+
+    private func imageInfo(for url: URL, mime: String) -> ImageInfo {
+        var w: UInt64?
+        var h: UInt64?
+        var size: UInt64?
+        if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
+            w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.uint64Value
+            h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.uint64Value
+        }
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
+            size = (attrs[.size] as? NSNumber)?.uint64Value
+        }
+        return ImageInfo(
+            height: h, width: w, mimetype: mime, size: size,
+            thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil, isAnimated: nil
+        )
     }
 
     func toggleReaction(targetEventId: String, key: String) async {
