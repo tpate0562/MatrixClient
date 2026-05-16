@@ -120,15 +120,15 @@ private struct PinnedRow: View {
             case .message(let msg):
                 switch msg.msgType {
                 case .text(let t):
-                    Text(MarkdownRenderer.render(body: t.body, formatted: t.formatted, revealedSpoilers: []).0)
+                    Text(MarkdownRenderer.flatten(MarkdownRenderer.render(body: t.body, formatted: t.formatted, revealedSpoilers: []).segments))
                         .textSelection(.enabled)
                 case .notice(let n):
-                    Text(MarkdownRenderer.render(body: n.body, formatted: n.formatted, revealedSpoilers: []).0)
+                    Text(MarkdownRenderer.flatten(MarkdownRenderer.render(body: n.body, formatted: n.formatted, revealedSpoilers: []).segments))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 case .emote(let e):
                     Text("* \(senderName) ").italic()
-                        + Text(MarkdownRenderer.render(body: e.body, formatted: e.formatted, revealedSpoilers: []).0).italic()
+                        + Text(MarkdownRenderer.flatten(MarkdownRenderer.render(body: e.body, formatted: e.formatted, revealedSpoilers: []).segments)).italic()
                 case .image(let img):
                     Text("🖼 \(img.caption ?? img.filename)").foregroundStyle(.secondary)
                 case .file(let f):

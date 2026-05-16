@@ -480,6 +480,9 @@ final class RoomVM: ObservableObject, Identifiable {
         case .spoiler(let body):
             let pair = MessageBuilder.spoiler(body)
             msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .perLineSpoiler(let body):
+            let pair = MessageBuilder.perLineSpoilers(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
         case .none:
             // Check for inline ||spoiler|| syntax (Discord-style)
             if text.contains("||") {
@@ -507,6 +510,9 @@ final class RoomVM: ObservableObject, Identifiable {
         case .spoiler(let body):
             let pair = MessageBuilder.spoiler(body)
             msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .perLineSpoiler(let body):
+            let pair = MessageBuilder.perLineSpoilers(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
         case .none:
             if text.contains("||") {
                 let pair = MessageBuilder.inlineSpoilers(text)
@@ -529,6 +535,9 @@ final class RoomVM: ObservableObject, Identifiable {
             msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
         case .spoiler(let body):
             let pair = MessageBuilder.spoiler(body)
+            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .perLineSpoiler(let body):
+            let pair = MessageBuilder.perLineSpoilers(body)
             msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
         case .none:
             if text.contains("||") {

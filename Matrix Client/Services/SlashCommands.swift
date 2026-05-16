@@ -5,6 +5,9 @@ import MatrixRustSDK
 enum SlashCommand {
     case rainbow(String)
     case spoiler(String)
+    /// Multi-line message where one or more lines are their own `/spoiler` command.
+    /// Carries the full original text so each such line can be hidden independently.
+    case perLineSpoiler(String)
     case none(String)
 }
 
@@ -12,8 +15,23 @@ enum SlashCommandParser {
     static func parse(_ input: String) -> SlashCommand {
         let s = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if let body = strip(prefix: "/rainbow", from: s) { return .rainbow(body) }
-        if let body = strip(prefix: "/spoiler", from: s) { return .spoiler(body) }
+
+        let lines = input.split(separator: "\n", omittingEmptySubsequences: false)
+        if lines.count > 1 {
+            // Several lines, any of which is its own `/spoiler …` — hide them per-line.
+            if lines.contains(where: { spoilerBody(ofLine: String($0)) != nil }) {
+                return .perLineSpoiler(input)
+            }
+        } else if let body = strip(prefix: "/spoiler", from: s) {
+            return .spoiler(body)
+        }
         return .none(input)
+    }
+
+    /// If `line` (ignoring surrounding whitespace) is a `/spoiler …` command, return its
+    /// spoiler content; otherwise nil. Shared by the parser and `MessageBuilder`.
+    static func spoilerBody(ofLine line: String) -> String? {
+        strip(prefix: "/spoiler", from: line.trimmingCharacters(in: .whitespaces))
     }
 
     private static func strip(prefix: String, from s: String) -> String? {
@@ -51,6 +69,54 @@ enum MessageBuilder {
         // Matrix spec: hidden body becomes the spoiler content, fallback text is just brackets.
         let html = "<span data-mx-spoiler>\(escapeHTML(text))</span>"
         return ("[spoiler] \(text)", html)
+    }
+
+    /// Multi-line spoilers: every line that is a `/spoiler …` command becomes its own
+    /// hidden span; all other lines pass through unchanged. Blank lines are preserved.
+    static func perLineSpoilers(_ text: String) -> (plain: String, html: String) {
+        var plainLines: [String] = []
+        var htmlLines: [String] = []
+        for raw in text.components(separatedBy: "\n") {
+            let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
+            if let body = SlashCommandParser.spoilerBody(ofLine: line) {
+                plainLines.append("[spoiler] \(body)")
+                htmlLines.append("<span data-mx-spoiler>\(escapeHTML(body))</span>")
+            } else {
+                plainLines.append(line)
+                htmlLines.append(escapeHTML(line))
+            }
+        }
+        return (plainLines.joined(separator: "\n"), htmlLines.joined(separator: "<br>"))
+    }
+
+    /// Convert Discord-style ||spoiler|| syntax to Matrix spoiler HTML.
+    /// Supports multiple inline spoilers mixed with regular text.
+    static func inlineSpoilers(_ text: String) -> (plain: String, html: String) {
+        let pattern = "\\|\\|(.+?)\\|\\|"
+        let plain = text.replacingOccurrences(
+            of: pattern, with: "[spoiler] $1",
+            options: .regularExpression
+        )
+        // Build HTML by splitting on ||content|| and escaping each part
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return (text, escapeHTML(text))
+        }
+        let nsText = text as NSString
+        var html = ""
+        var lastEnd = 0
+        for match in regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)) {
+            // Append escaped text before this match
+            let before = nsText.substring(with: NSRange(location: lastEnd, length: match.range.location - lastEnd))
+            html += escapeHTML(before)
+            // Append spoiler span with escaped content
+            let content = nsText.substring(with: match.range(at: 1))
+            html += "<span data-mx-spoiler>\(escapeHTML(content))</span>"
+            lastEnd = match.range.location + match.range.length
+        }
+        // Append remaining text after last match
+        let remaining = nsText.substring(from: lastEnd)
+        html += escapeHTML(remaining)
+        return (plain, html)
     }
 
     private static func escapeHTML(_ s: String) -> String {

@@ -1,7 +1,9 @@
 import SwiftUI
+import MatrixRustSDK
 
 struct VerificationSheet: View {
     @ObservedObject var controller: VerificationController
+    @EnvironmentObject private var session: MatrixSession
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -30,8 +32,10 @@ struct VerificationSheet: View {
             placeholder
         case .incomingRequest(let senderId, let deviceId, let deviceName):
             incomingRequestView(senderId: senderId, deviceId: deviceId, deviceName: deviceName)
-        case .acknowledged, .sasStarting:
-            waitingForEmojis
+        case .acknowledged:
+            waitingView(label: "Waiting for emojis…")
+        case .sasStarting:
+            waitingView(label: "Waiting for the other device…")
         case .emojis(let items):
             emojisView(items: items)
         case .finished:
@@ -49,17 +53,37 @@ struct VerificationSheet: View {
         VStack(spacing: 12) {
             Image(systemName: "checkmark.shield").font(.system(size: 60)).foregroundStyle(.tint)
             Text("Verify this device").font(.title2.bold())
-            Text("Open Element on another signed-in device, find this session in Settings → Sessions, and tap Verify. You'll then compare emojis here.")
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+
+            if session.recoveryState != .enabled {
+                // Recovery is not set up — SAS verification will fail.
+                VStack(spacing: 6) {
+                    Label("Recovery keys needed first", systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout.bold())
+                        .foregroundStyle(.orange)
+                    Text("Interactive verification requires your recovery key. Close this sheet, choose \"Recover Encryption Keys\" from the menu, and enter your recovery key. The device will verify itself automatically.")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .background(Color.orange.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                Text("Open Element on another signed-in device, find this session in Settings \u{2192} Sessions, and tap Verify. You\u{2019}ll then compare emojis here.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack {
-                Button("Close") { controller.dismiss() }
+                Button("Close") { controller.dismiss(); dismiss() }
                 Spacer()
                 Button("Request from this device") {
                     Task { await controller.requestVerification() }
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(session.recoveryState != .enabled)
             }
         }
     }
@@ -90,10 +114,10 @@ struct VerificationSheet: View {
         }
     }
 
-    private var waitingForEmojis: some View {
+    private func waitingView(label: String) -> some View {
         VStack(spacing: 12) {
             ProgressView().controlSize(.large)
-            Text("Waiting for emojis…").foregroundStyle(.secondary)
+            Text(label).foregroundStyle(.secondary)
             Button("Cancel") { Task { await controller.cancel() } }
         }
     }
@@ -142,7 +166,7 @@ struct VerificationSheet: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("Close") { controller.dismiss() }
+            Button("Close") { controller.dismiss(); dismiss() }
         }
     }
 }

@@ -3,6 +3,7 @@ import MatrixRustSDK
 
 struct MainView: View {
     @EnvironmentObject private var session: MatrixSession
+    @EnvironmentObject private var mcpServer: MCPServer
     @State private var selectedRoomId: String?
     @State private var showCreateRoom = false
     @State private var roomCreationMode: CreateRoomView.Mode = .room
@@ -10,6 +11,7 @@ struct MainView: View {
     @State private var joinAlias: String = ""
     @State private var showRecovery = false
     @State private var showVerify = false
+    @State private var showMCPSettings = false
 
     var body: some View {
         NavigationSplitView {
@@ -32,6 +34,12 @@ struct MainView: View {
                             Button("Verify This Device…") { showVerify = true }
                             if session.recoveryState != .enabled {
                                 Button("Recover Encryption Keys…") { showRecovery = true }
+                            }
+                            Divider()
+                            Button(mcpServer.isRunning
+                                   ? "MCP Server… (running on :\(mcpServer.port))"
+                                   : "MCP Server…") {
+                                showMCPSettings = true
                             }
                             Divider()
                             Button("Reset sync cache…") {
@@ -79,6 +87,9 @@ struct MainView: View {
         }
         .sheet(isPresented: $showRecovery) {
             RecoverySheet()
+        }
+        .sheet(isPresented: $showMCPSettings) {
+            MCPSettingsView()
         }
         .sheet(isPresented: Binding(
             get: { showVerify || session.verification?.presented == true },

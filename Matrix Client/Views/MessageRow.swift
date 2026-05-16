@@ -276,6 +276,10 @@ private struct EventRow: View {
             }
             Button { onReact(eid) } label: { Image(systemName: "face.smiling") }
                 .buttonStyle(.plain).help("More reactions…")
+            if event.canBeRepliedTo {
+                Button { onReply(eid) } label: { Image(systemName: "arrowshape.turn.up.left") }
+                    .buttonStyle(.plain).help("Reply")
+            }
             Menu {
                 if event.canBeRepliedTo {
                     Button("Reply") { onReply(eid) }
@@ -328,31 +332,45 @@ private struct EventRow: View {
         let bubbleAlignment: Alignment = (alignment == .trailing) ? .trailing : .leading
         switch msg.msgType {
         case .text(let t):
-            let (attr, count) = MarkdownRenderer.render(body: t.body, formatted: t.formatted, revealedSpoilers: revealedSpoilers)
-            VStack(alignment: alignment, spacing: 4) {
-                renderableTextBody(
-                    attributed: attr,
-                    spoilerCount: count,
-                    edited: msg.isEdited,
-                    alignment: bubbleAlignment
-                )
-                if let url = attr.firstURL() {
-                    LinkPreview(url: url)
-                        .frame(maxWidth: 350, minHeight: 40)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
+            if isEmojiOnlyMessage(t.body) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(t.body.trimmingCharacters(in: .whitespacesAndNewlines))
+                        .font(.system(size: 44))
+                        .textSelection(.enabled)
+                    if msg.isEdited {
+                        Text("(edited)").font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: bubbleAlignment)
+            } else {
+                let (segments, count) = MarkdownRenderer.render(body: t.body, formatted: t.formatted, revealedSpoilers: revealedSpoilers)
+                VStack(alignment: alignment, spacing: 4) {
+                    renderSegments(
+                        segments,
+                        spoilerCount: count,
+                        edited: msg.isEdited,
+                        horizontal: alignment,
+                        secondary: false
+                    )
+                    if let url = firstURL(in: segments) {
+                        LinkPreview(url: url)
+                            .frame(maxWidth: 350, minHeight: 40)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
                 }
             }
         case .notice(let n):
-            let (attr, count) = MarkdownRenderer.render(body: n.body, formatted: n.formatted, revealedSpoilers: revealedSpoilers)
-            renderableTextBody(
-                attributed: attr,
+            let (segments, count) = MarkdownRenderer.render(body: n.body, formatted: n.formatted, revealedSpoilers: revealedSpoilers)
+            renderSegments(
+                segments,
                 spoilerCount: count,
                 edited: msg.isEdited,
-                alignment: bubbleAlignment,
+                horizontal: alignment,
                 secondary: true
             )
         case .emote(let e):
-            let (attr, _) = MarkdownRenderer.render(body: e.body, formatted: e.formatted, revealedSpoilers: revealedSpoilers)
+            let (segments, _) = MarkdownRenderer.render(body: e.body, formatted: e.formatted, revealedSpoilers: revealedSpoilers)
+            let attr = MarkdownRenderer.flatten(segments)
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 (Text("* \(senderName) ").italic() + Text(attr).italic())
             }
@@ -414,6 +432,94 @@ private struct EventRow: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+    }
+
+    /// Render a list of `MarkdownRenderer.Segment`s — text runs get inline formatting
+    /// + spoiler hit-testing via `renderableTextBody`; code blocks get their own bordered
+    /// `CodeBlockView`. For single-text-segment messages we keep the old inline layout
+    /// (edited indicator + spoiler eye sit on the last line); for mixed messages the
+    /// edited/spoiler indicators move to a trailing row so they don't collide with the
+    /// code block's chrome.
+    @ViewBuilder
+    private func renderSegments(_ segments: [MarkdownRenderer.Segment],
+                                spoilerCount: Int,
+                                edited: Bool,
+                                horizontal: HorizontalAlignment,
+                                secondary: Bool) -> some View {
+        let bubbleAlignment: Alignment = (horizontal == .trailing) ? .trailing : .leading
+        let hasCodeBlocks = segments.contains { if case .codeBlock = $0 { return true } else { return false } }
+        if !hasCodeBlocks, segments.count == 1, case .text(let attr) = segments[0] {
+            renderableTextBody(
+                attributed: attr,
+                spoilerCount: spoilerCount,
+                edited: edited,
+                alignment: bubbleAlignment,
+                secondary: secondary
+            )
+        } else {
+            VStack(alignment: horizontal, spacing: 6) {
+                ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                    switch seg {
+                    case .text(let attr):
+                        textOnlyBody(attr, alignment: bubbleAlignment, secondary: secondary)
+                    case .codeBlock(let lang, let code):
+                        CodeBlockView(language: lang, code: code)
+                    }
+                }
+                if edited || (spoilerCount > 0 && revealedSpoilers.count < spoilerCount) {
+                    HStack(spacing: 6) {
+                        if edited {
+                            Text("(edited)").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        if spoilerCount > 0 && revealedSpoilers.count < spoilerCount {
+                            Image(systemName: "eye.slash")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .help("Tap a hidden block to reveal it")
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: bubbleAlignment)
+                }
+            }
+        }
+    }
+
+    /// A text segment with spoiler tap-to-reveal but no trailing indicators — used when
+    /// the segment is one of many in a mixed message.
+    @ViewBuilder
+    private func textOnlyBody(_ attr: AttributedString, alignment: Alignment, secondary: Bool) -> some View {
+        let textView = Text(attr)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .tint(.blue)
+        let styled: AnyView = secondary
+            ? AnyView(textView.foregroundStyle(.secondary))
+            : AnyView(textView)
+        styled
+            .environment(\.openURL, OpenURLAction { url in
+                if url.scheme == "spoiler",
+                   let idx = Int(url.host ?? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))) {
+                    if revealedSpoilers.contains(idx) {
+                        revealedSpoilers.remove(idx)
+                    } else {
+                        revealedSpoilers.insert(idx)
+                    }
+                    return .handled
+                }
+                return .systemAction
+            })
+            .frame(maxWidth: .infinity, alignment: alignment)
+    }
+
+    /// First URL across all text segments. Used to pick which LinkPreview to surface
+    /// below the bubble.
+    private func firstURL(in segments: [MarkdownRenderer.Segment]) -> URL? {
+        for segment in segments {
+            if case .text(let attr) = segment, let url = attr.firstURL() {
+                return url
+            }
+        }
+        return nil
     }
 
     /// Text body that supports per-spoiler tap-to-reveal. We render via Text + AttributedString
@@ -819,6 +925,33 @@ struct LinkPreview: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: LPLinkView, context: Context) {}
+}
+
+private extension Character {
+    /// True for pictographic emoji (excludes plain ASCII digits/`#`/`*` which are
+    /// technically `isEmoji` but only become emoji with a keycap sequence).
+    var isEmojiGlyph: Bool {
+        guard let first = unicodeScalars.first else { return false }
+        if unicodeScalars.count > 1 {
+            return unicodeScalars.contains { $0.properties.isEmojiPresentation || $0.properties.isEmoji }
+        }
+        return first.properties.isEmojiPresentation
+            || (first.properties.isEmoji && first.value > 0x238C)
+    }
+}
+
+/// A message whose visible content is only emoji (and whitespace) — rendered large,
+/// jumbo-style, like other chat clients. Capped so a wall of emoji stays sane.
+private func isEmojiOnlyMessage(_ body: String) -> Bool {
+    let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return false }
+    var count = 0
+    for ch in trimmed where !ch.isWhitespace {
+        guard ch.isEmojiGlyph else { return false }
+        count += 1
+        if count > 24 { return false }
+    }
+    return count > 0
 }
 
 extension AttributedString {

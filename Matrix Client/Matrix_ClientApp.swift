@@ -7,6 +7,7 @@ struct Matrix_ClientApp: App {
     @StateObject private var nicknames = NicknameStore()
     @StateObject private var reactionHistory = ReactionHistoryStore()
     @StateObject private var gate = BiometricGate()
+    @StateObject private var mcpServer = MCPServer()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -28,6 +29,11 @@ struct Matrix_ClientApp: App {
                 .environmentObject(nicknames)
                 .environmentObject(reactionHistory)
                 .environmentObject(gate)
+                .environmentObject(mcpServer)
+                .onAppear {
+                    mcpServer.attach(session: session)
+                    if mcpServer.autoStart { mcpServer.start() }
+                }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active { gate.refreshState() }
                 }
@@ -46,7 +52,8 @@ struct Matrix_ClientApp: App {
         }
 
         Settings {
-            Text("Matrix Client").padding()
+            MCPSettingsView()
+                .environmentObject(mcpServer)
         }
     }
 }

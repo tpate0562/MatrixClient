@@ -1,5 +1,6 @@
 import SwiftUI
 import MatrixRustSDK
+import UniformTypeIdentifiers
 
 struct RoomAdminView: View {
     @ObservedObject var room: RoomVM
@@ -101,6 +102,57 @@ struct RoomAdminView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            Field(label: "Export") {
+                Button("Export Chat as Text") {
+                    exportChat()
+                }
+            }
+        }
+    }
+
+    private func exportChat() {
+        var lines = [String]()
+        lines.append("Export of Room: \(room.displayName)")
+        lines.append("ID: \(room.id)")
+        lines.append(String(repeating: "=", count: 40))
+        
+        let df = DateFormatter()
+        df.dateStyle = .short
+        df.timeStyle = .short
+
+        for item in room.items {
+            if let event = item.asEvent() {
+                let sender = nicknames.displayName(for: event.sender, fallback: event.sender)
+                let date = Date(timeIntervalSince1970: TimeInterval(event.timestamp) / 1000.0)
+                var body = ""
+                
+                if case .msgLike(let content) = event.content, case .message(let msg) = content.kind {
+                    switch msg.msgType {
+                    case .text(let t): body = t.body
+                    case .emote(let e): body = "* \(e.body)"
+                    case .image(let img): body = "[Image: \(img.filename)]"
+                    case .video(let v): body = "[Video: \(v.filename)]"
+                    case .audio(let a): body = "[Audio: \(a.filename)]"
+                    case .file(let f): body = "[File: \(f.filename)]"
+                    case .notice(let n): body = "[Notice: \(n.body)]"
+                    default: body = "[Media]"
+                    }
+                } else if case .roomMembership(_, _, let change, _) = event.content {
+                    body = "[Membership change: \(String(describing: change ?? .left))]"
+                }
+                
+                if !body.isEmpty {
+                    lines.append("[\(df.string(from: date))] \(sender): \(body)")
+                }
+            }
+        }
+        
+        let output = lines.joined(separator: "\n")
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "ChatExport-\(room.displayName.prefix(20)).txt"
+        if panel.runModal() == .OK, let url = panel.url {
+            try? output.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 

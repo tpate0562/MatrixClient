@@ -30,10 +30,12 @@ final class VerificationController: ObservableObject {
     @Published var presented: Bool = false
 
     private let controller: SessionVerificationController
+    private let encryption: Encryption?
     private var delegate: Box?
 
-    init(controller: SessionVerificationController) {
+    init(controller: SessionVerificationController, encryption: Encryption? = nil) {
         self.controller = controller
+        self.encryption = encryption
         let box = Box(owner: self)
         self.delegate = box
         controller.setDelegate(delegate: box)
@@ -48,6 +50,18 @@ final class VerificationController: ObservableObject {
     /// "Verify this device" from this app. Element on the user's other device will get a
     /// prompt to accept.
     func requestVerification() async {
+        // Cancel any stale verification that Element Desktop might still hold.
+        // Without this, Element sees a "new request while another is ongoing"
+        // and cancels BOTH, corrupting the SAS state.
+        do {
+            try await controller.cancelVerification()
+        } catch {
+            // No stale request to cancel — that's fine
+        }
+        // Give Element Desktop time to process the cancellation before we send
+        // a new request. Without this delay the new request races with the cancel
+        // and Element sees both as concurrent.
+        try? await Task.sleep(nanoseconds: 1_500_000_000) // 1.5 s
         do {
             try await controller.requestDeviceVerification()
         } catch {
@@ -55,16 +69,20 @@ final class VerificationController: ObservableObject {
         }
     }
 
-    /// Accept an incoming verification request and immediately transition to SAS.
+    /// Accept an incoming verification request. The SDK will handle the SAS
+    /// transition internally — we just need to accept and wait.
     func acceptIncoming() async {
         guard case .incomingRequest(let senderId, _, _) = phase else { return }
-        // We need the flow id to acknowledge; capture it from the original request.
-        guard let flowId = lastFlowId else { return }
+        guard let flowId = lastFlowId else {
+            return
+        }
         do {
             try await controller.acknowledgeVerificationRequest(senderId: senderId, flowId: flowId)
             try await controller.acceptVerificationRequest()
-            try await controller.startSasVerification()
-            phase = .sasStarting
+            // Do NOT call startSasVerification() here. The Rust SDK's internal
+            // request-state listener handles the SAS transition automatically
+            // (via the Transitioned state). Element X iOS also does not call it.
+            phase = .acknowledged
         } catch {
             phase = .failed(reason: describe(error))
         }
@@ -72,8 +90,16 @@ final class VerificationController: ObservableObject {
 
     /// Confirm "the emojis match on both sides".
     func confirmMatch() async {
+        // Diagnostic: log verification and recovery state before approving
+        if let enc = encryption {
+            let verState = enc.verificationState()
+            let recovState = enc.recoveryState()
+        } else {
+        }
         do {
             try await controller.approveVerification()
+            // Don't change phase here. The delegate will move us to .finished
+            // or .cancelled once the other side responds.
         } catch {
             phase = .failed(reason: describe(error))
         }
@@ -121,6 +147,9 @@ final class VerificationController: ObservableObject {
     }
 
     fileprivate func acceptedRequest() {
+        // The other device accepted our request. We are the initiator — we do NOT call
+        // startSasVerification here. The receiver (other device) will send the SAS start
+        // message, and we'll get didStartSasVerification when it arrives.
         phase = .acknowledged
     }
 
@@ -134,15 +163,22 @@ final class VerificationController: ObservableObject {
             let mapped = raw.map { Emoji(symbol: $0.symbol(), description: $0.description()) }
             phase = .emojis(items: mapped)
         case .decimals(let values):
-            // No emoji support — fall back to showing the numeric SAS as text emojis.
             let mapped = values.map { Emoji(symbol: "\($0)", description: "Code") }
             phase = .emojis(items: mapped)
         }
     }
 
-    fileprivate func failed() { phase = .failed(reason: nil) }
-    fileprivate func cancelledByOther() { phase = .cancelled(reason: nil) }
-    fileprivate func finishedSuccessfully() { phase = .finished }
+    fileprivate func failed() {
+        phase = .failed(reason: nil)
+    }
+
+    fileprivate func cancelledByOther() {
+        phase = .cancelled(reason: nil)
+    }
+
+    fileprivate func finishedSuccessfully() {
+        phase = .finished
+    }
 
     // MARK: - Sendable callback box
 
