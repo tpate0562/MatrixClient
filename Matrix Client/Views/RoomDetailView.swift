@@ -7,14 +7,6 @@ private enum SearchMode: String, CaseIterable {
     case closest = "Best Match"
 }
 
-private func messageText(from item: TimelineItem) -> String? {
-    guard let event = item.asEvent(),
-          case .msgLike(let content) = event.content,
-          case .message(let msg) = content.kind,
-          case .text(let t) = msg.msgType else { return nil }
-    return t.body
-}
-
 private func fuzzyScore(query: String, in text: String) -> Double {
     let q = query.lowercased(), t = text.lowercased()
     var qi = q.startIndex
@@ -45,25 +37,34 @@ struct RoomDetailView: View {
     @State private var showSearch = false
     @State private var searchQuery = ""
     @State private var searchMode: SearchMode = .exact
-    @State private var isAtBottom: Bool = true
     @State private var showImportPicker = false
+    // Only the newest `displayLimit` messages are built into the view tree;
+    // scrolling to the top sentinel reveals another page.
+    @State private var displayLimit: Int = 50
+    @State private var loadingMoreWindow = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
             if showSearch { searchBar }
-            if showSearch && !searchQuery.isEmpty {
-                searchResultsView
-            } else {
-                timeline
+            Group {
+                if showSearch && !searchQuery.isEmpty {
+                    searchResultsView
+                } else if !room.initialLoadComplete {
+                    loadingView.transition(.opacity)
+                } else {
+                    timeline.transition(.opacity)
+                }
             }
+            .animation(.easeInOut(duration: 0.35), value: room.initialLoadComplete)
             Divider()
             composer
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
+                    displayLimit = 50
                     Task { await room.forceReload() }
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
@@ -188,21 +189,22 @@ struct RoomDetailView: View {
         }
     }
 
-    private var searchResults: [TimelineItem] {
+    /// Search runs over the full, disk-backed message cache (entire history),
+    /// not just what's currently loaded into the timeline window.
+    private var searchResults: [RoomVM.CachedMessage] {
         guard !searchQuery.isEmpty else { return [] }
         let query = searchQuery.lowercased()
+        let all = room.cachedMessages
         switch searchMode {
         case .exact:
-            return room.items.filter { item in
-                guard let text = messageText(from: item) else { return false }
-                return text.lowercased().contains(query)
-            }
+            return all
+                .filter { $0.body.lowercased().contains(query) }
+                .sorted { $0.timestamp > $1.timestamp }
         case .closest:
-            return room.items
-                .compactMap { item -> (TimelineItem, Double)? in
-                    guard let text = messageText(from: item) else { return nil }
-                    let score = fuzzyScore(query: query, in: text)
-                    return score >= 0.6 ? (item, score) : nil
+            return all
+                .compactMap { m -> (RoomVM.CachedMessage, Double)? in
+                    let score = fuzzyScore(query: query, in: m.body)
+                    return score >= 0.6 ? (m, score) : nil
                 }
                 .sorted { $0.1 > $1.1 }
                 .map(\.0)
@@ -210,43 +212,22 @@ struct RoomDetailView: View {
     }
 
     private var searchResultsView: some View {
-        ScrollView {
+        let results = searchResults
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                if searchResults.isEmpty {
+                if results.isEmpty {
                     Text("No results for \"\(searchQuery)\"")
                         .font(.callout).foregroundStyle(.secondary)
                         .padding().frame(maxWidth: .infinity)
                 } else {
-                    Text("\(searchResults.count) result\(searchResults.count == 1 ? "" : "s")")
+                    Text("\(results.count) result\(results.count == 1 ? "" : "s") · searched all history")
                         .font(.caption).foregroundStyle(.tertiary)
                         .padding(.horizontal, 12).padding(.top, 8)
-                    ForEach(searchResults.indices, id: \.self) { idx in
-                        let item = searchResults[idx]
-                        TimelineRow(
-                            item: item,
-                            room: room,
-                            isGroupContinuation: false,
-                            onReact: { id in emojiTargetEventId = id },
-                            onQuickReact: { id, key in
-                                reactionHistory.record(key)
-                                Task { await room.toggleReaction(targetEventId: id, key: key) }
-                            },
-                            onReply: { id in replyingToId = id; withAnimation { showSearch = false }; searchQuery = "" },
-                            onRedact: { id in Task { await room.redact(eventId: id) } },
-                            onTogglePin: { id in Task { await room.togglePin(eventId: id) } },
-                            onShowSource: { sourceItem = item },
-                            onEditNickname: editNickname,
-                            onEdit: { id, body in
-                                replyingToId = nil
-                                editingId = id
-                                editingOriginalBody = body
-                                draft = body
-                                withAnimation { showSearch = false }
-                                searchQuery = ""
-                            }
-                        )
-                        .id(item.uniqueId().id)
-                        .padding(.top, 8)
+                    ForEach(results) { msg in
+                        CachedMessageRow(message: msg, members: room.members,
+                                         isGroupContinuation: false)
+                            .id(msg.id)
+                            .padding(.top, 8)
                     }
                 }
             }
@@ -312,15 +293,41 @@ struct RoomDetailView: View {
             result.append(.cached(orphans[cacheIdx]))
             cacheIdx += 1
         }
-        return result
+        // Guarantee unique `ForEach` identities — duplicate ids render as
+        // undefined behavior (rows vanish / scroll jumps). Keep the last copy.
+        var seen = Set<String>()
+        var deduped: [DisplayItem] = []
+        deduped.reserveCapacity(result.count)
+        for item in result.reversed() where seen.insert(item.stableId).inserted {
+            deduped.append(item)
+        }
+        return deduped.reversed()
+    }
+
+    private var loadingView: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Loading messages…")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var timeline: some View {
-        ScrollViewReader { proxy in
+        let allRows = displayItems
+        let rows = allRows.count > displayLimit
+            ? Array(allRows.suffix(displayLimit))
+            : allRows
+        return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     paginationHeader
-                    let rows = displayItems
+                    // Reaching the top of the in-RAM window pulls in the next
+                    // page (older cached rows, then older from the server).
+                    Color.clear.frame(height: 1)
+                        .onAppear { loadMoreIfNeeded(total: allRows.count) }
                     ForEach(Array(rows.enumerated()), id: \.element.stableId) { idx, displayItem in
                         let grouped = isGroupContinuation(at: idx, in: rows)
                         switch displayItem {
@@ -356,20 +363,49 @@ struct RoomDetailView: View {
                         }
                     }
                     Color.clear.frame(height: 1).id("__bottom__")
-                        .onAppear { isAtBottom = true }
-                        .onDisappear { isAtBottom = false }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
-            .onChange(of: room.items.last?.uniqueId().id) {
-                if isAtBottom {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("__bottom__", anchor: .bottom)
-                    }
-                }
+            // `defaultScrollAnchor(.bottom)` keeps the view pinned to the
+            // newest message as content size changes — crucially while row
+            // heights settle async (images / markdown / link previews) and as
+            // new messages arrive. The explicit `scrollTo` kick is still
+            // needed because a LazyVStack won't materialize its rows under
+            // `defaultScrollAnchor` alone until something scrolls it.
+            .defaultScrollAnchor(.bottom)
+            .onAppear { jumpToBottom(proxy) }
+            .onChange(of: room.initialLoadComplete) { _, done in
+                if done { jumpToBottom(proxy) }
             }
-            .onAppear {
-                proxy.scrollTo("__bottom__", anchor: .bottom)
+        }
+    }
+
+    /// Force the LazyVStack to materialize and snap to the newest message.
+    /// Retried over ~1 s, non-animated, because rows build lazily and their
+    /// heights keep growing as async content (images, link previews) loads.
+    private func jumpToBottom(_ proxy: ScrollViewProxy) {
+        func go() { proxy.scrollTo("__bottom__", anchor: .bottom) }
+        go()
+        for delay in [0.0, 0.1, 0.3, 0.6, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: go)
+        }
+    }
+
+    /// Grow the in-RAM window, or paginate older history from the server once
+    /// the window already covers everything that's loaded.
+    private func loadMoreIfNeeded(total: Int) {
+        guard !loadingMoreWindow else { return }
+        if displayLimit < total {
+            loadingMoreWindow = true
+            displayLimit += 50
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                loadingMoreWindow = false
+            }
+        } else if room.canPaginate && !room.paginating {
+            loadingMoreWindow = true
+            Task {
+                await room.paginate()
+                loadingMoreWindow = false
             }
         }
     }

@@ -31,6 +31,10 @@ final class RoomVM: ObservableObject, Identifiable {
     private var historicalItems: [TimelineItem] = []
     @Published var paginating: Bool = false
     @Published var canPaginate: Bool = true
+    // False until the initial timeline burst has loaded + settled, so the UI
+    // can show a spinner and only reveal the chat once it will render anchored
+    // at the bottom (rather than flashing in mid-load at the wrong position).
+    @Published var initialLoadComplete: Bool = false
     @Published var typingUserIds: Set<String> = []
     @Published var members: [String: RoomMember] = [:]
     @Published var membersLoaded: Bool = false
@@ -41,6 +45,18 @@ final class RoomVM: ObservableObject, Identifiable {
     private var typingHandle: TaskHandle?
     private var listenerBox: AnyObject?
     private var autoPaginateTask: Task<Void, Never>?
+
+    // Periodic safety-net refresh. The live timeline under sliding sync doesn't
+    // always push reaction / edit / redaction updates to an already-open
+    // timeline, so every 3 s we build a throwaway live timeline, hash its
+    // content, and only re-attach (surfacing the change) when the hash differs.
+    // When nothing changed we touch nothing — no flicker, no scroll jump.
+    private var autoRefreshTask: Task<Void, Never>?
+    private var lastRefreshSignature: Int = 0
+    private var hasRefreshBaseline: Bool = false
+    // Once a backward sweep hits the start of history we stop re-sweeping on
+    // every refresh-driven reset (the disk cache already has it).
+    private var historyFullyLoaded: Bool = false
 
     // Bridge timeline: used to continue history past the sliding-sync prev_batch wall
     // by anchoring at the oldest known event and using the /context API token chain.
@@ -88,6 +104,8 @@ final class RoomVM: ObservableObject, Identifiable {
     func detach() {
         autoPaginateTask?.cancel()
         autoPaginateTask = nil
+        autoRefreshTask?.cancel()
+        autoRefreshTask = nil
         saveCacheDebounce?.cancel()
         saveCacheDebounce = nil
         timelineHandle = nil
@@ -112,6 +130,9 @@ final class RoomVM: ObservableObject, Identifiable {
         sdkItems.removeAll()
         canPaginate = true
         paginating = false
+        lastRefreshSignature = 0
+        hasRefreshBaseline = false
+        historyFullyLoaded = false
         await openTimeline()
     }
 
@@ -120,6 +141,7 @@ final class RoomVM: ObservableObject, Identifiable {
     /// Open a live timeline + room-info + typing listeners. Idempotent — calling twice is a no-op.
     func openTimeline() async {
         guard timeline == nil else { return }
+        initialLoadComplete = false
         print("[Timeline:\(id.prefix(8))] openTimeline room=\(displayName.prefix(20))")
         do {
             let t = try await room.timeline()
@@ -154,9 +176,31 @@ final class RoomVM: ObservableObject, Identifiable {
         // Begin loading the full room history in the background.
         startAutoPaginate()
 
+        // Safety-net poll so reactions/edits show within 3 s even when the
+        // live timeline doesn't push them.
+        startAutoRefresh()
+
         // Open a long-lived pinned-events timeline so we have an authoritative
         // index of pinned event IDs, in addition to whatever RoomInfo reports.
         Task { await openPinnedIndex() }
+
+        // Flip `initialLoadComplete` once the first burst settles so the UI
+        // can reveal the chat already anchored at the bottom.
+        Task { [weak self] in await self?.markInitialLoadWhenSettled() }
+    }
+
+    /// Hold the loading spinner until the recent window (~50 messages) has
+    /// actually loaded — or the whole (smaller) room has, or a safety cap is
+    /// hit — so the chat reveals already anchored at the bottom.
+    private func markInitialLoadWhenSettled() async {
+        let start = Date()
+        while Date().timeIntervalSince(start) < 20 {
+            if items.count >= 50 { break }                 // recent window is in
+            if historyFullyLoaded { break }                // whole room loaded
+            if !canPaginate && !items.isEmpty { break }    // nothing more to load
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        initialLoadComplete = true
     }
 
     private func openPinnedIndex() async {
@@ -218,8 +262,11 @@ final class RoomVM: ObservableObject, Identifiable {
     }
 
     private func recomputePinnedEventIds() {
+        // Sorted so the value is stable across recomputes — the pinned sheet keys
+        // its fetch off this list via `.task(id:)` and must not churn on reorder.
         let combined = pinnedFromIndex.union(pinnedFromRoomInfo)
-        pinnedEventIds = Array(combined)
+        let sorted = combined.sorted()
+        if sorted != pinnedEventIds { pinnedEventIds = sorted }
     }
 
     /// Walk backwards through the timeline until the SDK reports no more history. Runs
@@ -272,6 +319,7 @@ final class RoomVM: ObservableObject, Identifiable {
                     let count = await MainActor.run { self.items.count }
                     print("[Pagination:\(roomId)] reached sync wall after \(page) pages, \(count) items — trying context bridge")
                     await self.runBridgePagination(roomId: roomId)
+                    await MainActor.run { self.historyFullyLoaded = true }
                     break
                 }
                 // Yield briefly so we don't hog the network or the main thread.
@@ -348,7 +396,7 @@ final class RoomVM: ObservableObject, Identifiable {
                 var merged = self.historicalItems
                 merged.removeAll { h in self.sdkItems.contains { $0.uniqueId().id == h.uniqueId().id } }
                 merged.append(contentsOf: self.sdkItems)
-                self.items = merged
+                self.items = self.dedupedForDisplay(merged)
             }
             let final = await MainActor.run { self.items.count }
             print("[Pagination:\(roomId)] bridge – done, total items now \(final)")
@@ -386,6 +434,111 @@ final class RoomVM: ObservableObject, Identifiable {
         }
     }
 
+    // MARK: - Periodic safety-net refresh
+
+    func startAutoRefresh() {
+        guard autoRefreshTask == nil else { return }
+        autoRefreshTask = Task { [weak self] in
+            while let self, await !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if Task.isCancelled { break }
+                await self.refreshTick()
+            }
+        }
+    }
+
+    /// Build a throwaway live timeline, hash its visible content, and only
+    /// re-attach the real listener when the hash changed. No change ⇒ we touch
+    /// nothing, so the UI (and scroll position) is left exactly as-is.
+    private func refreshTick() async {
+        // Only poll once the initial history sweep is done. Adopting a fresh
+        // timeline mid-sweep would reset pagination progress and thrash the
+        // load; until then the live listener already surfaces new messages.
+        guard historyFullyLoaded,
+              timeline != nil, bridgeTimeline == nil, !paginating else { return }
+        let config = TimelineConfiguration(
+            focus: .live(hideThreadedEvents: false),
+            filter: .all,
+            internalIdPrefix: "refresh-\(id)",
+            dateDividerMode: .daily,
+            trackReadReceipts: .disabled,
+            reportUtds: false
+        )
+        guard let fresh = try? await room.timelineWithConfiguration(configuration: config) else { return }
+        let acc = DiffAccumulator()
+        let tmpBox = TimelineListenerBox { diffs in
+            Task { @MainActor in acc.apply(diffs) }
+        }
+        let tmpHandle = await fresh.addListener(listener: tmpBox)
+
+        // Let the initial burst settle (a few short waits, bail early once stable).
+        var lastCount = -1
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            let c = acc.items.count
+            if c == lastCount && c > 0 { break }
+            lastCount = c
+        }
+
+        let signature = timelineSignature(acc.items)
+        _ = tmpHandle  // keep the temp subscription alive until here
+        // First poll just records a baseline — don't adopt (nothing has
+        // "changed" yet relative to what's already on screen).
+        guard hasRefreshBaseline else {
+            hasRefreshBaseline = true
+            lastRefreshSignature = signature
+            return
+        }
+        guard signature != lastRefreshSignature else { return }   // nothing changed
+        lastRefreshSignature = signature
+
+        // Something changed — adopt this fresh timeline. Attaching the real
+        // listener triggers a `.reset` that repopulates sdkItems with correct
+        // indices, so future diffs stay consistent.
+        guard !Task.isCancelled else { return }
+        timelineHandle = nil
+        listenerBox = nil
+        timeline = fresh
+        let liveBox = TimelineListenerBox { [weak self] diffs in
+            Task { @MainActor in self?.applyDiffs(diffs) }
+        }
+        listenerBox = liveBox
+        timelineHandle = await fresh.addListener(listener: liveBox)
+    }
+
+    private func timelineSignature(_ items: [TimelineItem]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(items.count)
+        for item in items {
+            guard let ev = item.asEvent() else {
+                hasher.combine(item.uniqueId().id)
+                continue
+            }
+            if case .eventId(let eid) = ev.eventOrTransactionId {
+                hasher.combine(eid)
+            } else {
+                hasher.combine(item.uniqueId().id)
+            }
+            hasher.combine(Int(ev.timestamp))
+            if case .msgLike(let content) = ev.content {
+                switch content.kind {
+                case .message(let m):
+                    hasher.combine(m.body)
+                    hasher.combine(m.isEdited)
+                case .redacted:
+                    hasher.combine("redacted")
+                default:
+                    break
+                }
+                for r in content.reactions.sorted(by: { $0.key < $1.key }) {
+                    hasher.combine(r.key)
+                    hasher.combine(r.senders.count)
+                }
+            }
+        }
+        return hasher.finalize()
+    }
+
     private func apply(info: RoomInfo) {
         displayName = info.displayName ?? id
         topic = info.topic
@@ -416,10 +569,10 @@ final class RoomVM: ObservableObject, Identifiable {
                     }
                 }
                 sdkItems.removeAll()
-                canPaginate = true
+                canPaginate = !historyFullyLoaded
                 autoPaginateTask?.cancel()
                 autoPaginateTask = nil
-                startAutoPaginate()
+                if !historyFullyLoaded { startAutoPaginate() }
             case .pushFront(let value):
                 sdkItems.insert(value, at: 0)
             case .pushBack(let value):
@@ -450,10 +603,10 @@ final class RoomVM: ObservableObject, Identifiable {
                     }
                 }
                 sdkItems = values
-                canPaginate = true
+                canPaginate = !historyFullyLoaded
                 autoPaginateTask?.cancel()
                 autoPaginateTask = nil
-                startAutoPaginate()
+                if !historyFullyLoaded { startAutoPaginate() }
             }
         }
         
@@ -463,9 +616,32 @@ final class RoomVM: ObservableObject, Identifiable {
             sdkItems.contains(where: { $0.uniqueId().id == histItem.uniqueId().id })
         }
         newItems.append(contentsOf: sdkItems)
-        items = newItems
+        items = dedupedForDisplay(newItems)
 
         scheduleCacheSave()
+    }
+
+    /// Collapse items that resolve to the same SwiftUI `ForEach` identity
+    /// (event id, or unique id for virtuals). After a refresh adoption or the
+    /// history bridge merge, the same event can appear twice — a stale
+    /// historical copy and a fresh one with a different SDK `uniqueId`. Keep
+    /// the LAST occurrence: the freshest copy sits later in the list.
+    private func dedupedForDisplay(_ list: [TimelineItem]) -> [TimelineItem] {
+        var seen = Set<String>()
+        var reversed: [TimelineItem] = []
+        reversed.reserveCapacity(list.count)
+        for item in list.reversed() {
+            let key: String
+            if let ev = item.asEvent(), case .eventId(let eid) = ev.eventOrTransactionId {
+                key = "e:" + eid
+            } else {
+                key = "u:" + item.uniqueId().id
+            }
+            if seen.insert(key).inserted {
+                reversed.append(item)
+            }
+        }
+        return reversed.reversed()
     }
 
     // MARK: - Timeline actions

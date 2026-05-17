@@ -23,6 +23,7 @@ final class MatrixSession: ObservableObject {
     private var recoveryStateHandle: TaskHandle?
     private var verificationStateHandle: TaskHandle?
     private var listenerBox: RoomListListener?
+    private var didPreloadTimelines = false
     @Published private(set) var verificationState: VerificationState = .unknown
     @Published private(set) var verification: VerificationController?
 
@@ -363,6 +364,15 @@ final class MatrixSession: ObservableObject {
         rooms = newRooms
         roomOrder = newOrder
         invites = newInvites
+
+        // Warm every room's timeline once, in the background, so opening any
+        // chat is just rendering (no load wait). openTimeline() is idempotent;
+        // we go sequentially to avoid a thundering herd on launch.
+        if !didPreloadTimelines && !newOrder.isEmpty {
+            didPreloadTimelines = true
+            let vms = newOrder.compactMap { newRooms[$0] }
+            Task { for vm in vms { await vm.openTimeline() } }
+        }
     }
 
     // MARK: - Top-level actions

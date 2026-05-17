@@ -59,7 +59,7 @@ struct PinnedEventsView: View {
             }
         }
         .frame(width: 640, height: 540)
-        .task { await vm.open() }
+        .task(id: room.pinnedEventIds) { await vm.open(eventIds: room.pinnedEventIds) }
         .onDisappear { vm.close() }
     }
 }

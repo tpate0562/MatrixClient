@@ -133,7 +133,7 @@ struct MessageComposer: View {
                 // Multi-line text editor that sends on Enter, newline on Shift+Enter
                 MultiLineInput(
                     text: $text,
-                    placeholder: room.isEncrypted ? "🔒 Send an encrypted message…" : "Send a message…",
+                    placeholder: room.isEncrypted ? "🔒 E2EE…" : "Send a message…",
                     controller: controller,
                     onCommit: onSend,
                     onPasteData: onPasteData,
@@ -198,6 +198,7 @@ struct MessageComposer: View {
         var handled = false
         for provider in providers {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                // Real files on disk (including image files from Finder).
                 handled = true
                 _ = provider.loadObject(ofClass: URL.self) { url, _ in
                     if let url, url.isFileURL {
@@ -205,10 +206,33 @@ struct MessageComposer: View {
                     }
                 }
             } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                // Image dragged from an app/browser (no file URL). Materialize it
+                // to a temp file so it's sent as a real image — images are files too.
                 handled = true
-                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
-                    guard let data else { return }
-                    Task { @MainActor in onPasteData(data, "dropped_image.png", "image/png") }
+                provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, _ in
+                    if let url {
+                        let ext = url.pathExtension.isEmpty ? "png" : url.pathExtension
+                        let dst = FileManager.default.temporaryDirectory
+                            .appendingPathComponent(UUID().uuidString)
+                            .appendingPathExtension(ext)
+                        do {
+                            try FileManager.default.copyItem(at: url, to: dst)
+                            Task { @MainActor in onAttach([dst]) }
+                        } catch {
+                            Task { @MainActor in
+                                if let data = try? Data(contentsOf: url) {
+                                    onPasteData(data, "dropped_image.\(ext)",
+                                                UTType(filenameExtension: ext)?.preferredMIMEType ?? "image/png")
+                                }
+                            }
+                        }
+                        return
+                    }
+                    // Last resort: raw bytes off the provider.
+                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                        guard let data else { return }
+                        Task { @MainActor in onPasteData(data, "dropped_image.png", "image/png") }
+                    }
                 }
             }
         }
@@ -464,7 +488,8 @@ struct MultiLineInput: NSViewRepresentable {
         textView.pasteDataHandler = onPasteData
         textView.autocompleteKeyHandler = autocompleteKeyHandler
         textView.fileDropHandler = onFileDrop
-        textView.registerForDraggedTypes([.fileURL])
+        textView.imageDataDropHandler = onPasteData
+        textView.registerForDraggedTypes([.fileURL, .png, .tiff, .fileContents])
         controller.attach(textView)
 
         let scroll = NSScrollView()
@@ -491,6 +516,7 @@ struct MultiLineInput: NSViewRepresentable {
         textView.pasteDataHandler = onPasteData
         textView.autocompleteKeyHandler = autocompleteKeyHandler
         textView.fileDropHandler = onFileDrop
+        textView.imageDataDropHandler = onPasteData
         textView.placeholderString = placeholder
         controller.attach(textView)
     }
@@ -543,6 +569,7 @@ class InputTextView: NSTextView {
     var pasteDataHandler: ((Data, String, String) -> Void)?  // data, filename, mime
     var autocompleteKeyHandler: ((AutocompleteKey) -> Bool)?
     var fileDropHandler: (([URL]) -> Void)?
+    var imageDataDropHandler: ((Data, String, String) -> Void)?  // data, filename, mime
     var placeholderString: String? {
         didSet { needsDisplay = true }
     }
@@ -597,29 +624,62 @@ class InputTextView: NSTextView {
 
     // MARK: - File drag & drop
 
+    private func canAcceptDrop(_ sender: NSDraggingInfo) -> Bool {
+        !droppedFileURLs(sender).isEmpty || droppedImageData(sender) != nil
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        droppedFileURLs(sender).isEmpty ? super.draggingEntered(sender) : .copy
+        canAcceptDrop(sender) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        droppedFileURLs(sender).isEmpty ? super.draggingUpdated(sender) : .copy
+        canAcceptDrop(sender) ? .copy : super.draggingUpdated(sender)
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        droppedFileURLs(sender).isEmpty ? super.prepareForDragOperation(sender) : true
+        canAcceptDrop(sender) ? true : super.prepareForDragOperation(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        // File URLs (including image files dragged from Finder) → attach as files.
         let urls = droppedFileURLs(sender)
-        if urls.isEmpty { return super.performDragOperation(sender) }
-        fileDropHandler?(urls)
-        return true
+        if !urls.isEmpty {
+            fileDropHandler?(urls)
+            return true
+        }
+        // Raw image data dragged from an app/browser → send as an image file.
+        if let img = droppedImageData(sender) {
+            imageDataDropHandler?(img.data, img.filename, img.mime)
+            return true
+        }
+        return super.performDragOperation(sender)
     }
 
     private func droppedFileURLs(_ sender: NSDraggingInfo) -> [URL] {
         let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         let objs = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: opts)
         return (objs as? [URL]) ?? []
+    }
+
+    /// Image bytes when an image is dragged in *without* a backing file URL
+    /// (e.g. dragged out of a browser or Photos). Normalized to PNG.
+    private func droppedImageData(_ sender: NSDraggingInfo) -> (data: Data, filename: String, mime: String)? {
+        let pb = sender.draggingPasteboard
+        if let png = pb.data(forType: .png) {
+            return (png, "dropped_image.png", "image/png")
+        }
+        if let tiff = pb.data(forType: .tiff),
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return (png, "dropped_image.png", "image/png")
+        }
+        if let img = NSImage(pasteboard: pb),
+           let tiff = img.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return (png, "dropped_image.png", "image/png")
+        }
+        return nil
     }
 
     override func paste(_ sender: Any?) {
