@@ -105,6 +105,14 @@ private struct EventRow: View {
         return nil
     }
 
+    /// Transaction id of a local echo that hasn't successfully sent yet
+    /// (still "sending" or send-failed) — i.e. something we can still cancel.
+    private var pendingTransactionId: String? {
+        guard let state = event.localSendState, !isSent(state) else { return nil }
+        if case .transactionId(let tx) = event.eventOrTransactionId { return tx }
+        return nil
+    }
+
     private var serverSenderName: String {
         if case .ready(let name, _, _) = event.senderProfile, let n = name { return n }
         return event.sender
@@ -215,6 +223,12 @@ private struct EventRow: View {
         .background(rowBackground)
         .overlay(alignment: isOwn ? .topLeading : .topTrailing) { hoverActionsOverlay }
         .contextMenu {
+            if let tx = pendingTransactionId {
+                Button("Discard Unsent Message", role: .destructive) {
+                    Task { await room.cancelSend(transactionId: tx) }
+                }
+                Divider()
+            }
             if let eid = eventId {
                 if event.canBeRepliedTo {
                     Button("Reply") { onReply(eid) }

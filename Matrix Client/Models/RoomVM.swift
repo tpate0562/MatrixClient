@@ -885,6 +885,19 @@ final class RoomVM: ObservableObject, Identifiable {
         } catch { session?.lastError = describe(error) }
     }
 
+    /// Cancel a still-sending (or send-failed) local echo. Redacting a local
+    /// echo by its transaction id removes it from the send queue — the only
+    /// way to clear a message wedged in "sending" (e.g. a stuck upload).
+    func cancelSend(transactionId: String) async {
+        guard let timeline else { return }
+        do {
+            try await timeline.redactEvent(
+                eventOrTransactionId: .transactionId(transactionId: transactionId),
+                reason: nil
+            )
+        } catch { session?.lastError = describe(error) }
+    }
+
     func pin(eventId: String) async {
         guard let timeline else { return }
         // Optimistic: flip the indicator immediately so the UI feels responsive,
