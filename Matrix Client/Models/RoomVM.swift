@@ -58,12 +58,9 @@ final class RoomVM: ObservableObject, Identifiable {
     // every refresh-driven reset (the disk cache already has it).
     private var historyFullyLoaded: Bool = false
 
-    // Bridge timeline: used to continue history past the sliding-sync prev_batch wall
-    // by anchoring at the oldest known event and using the /context API token chain.
-    private var bridgeTimeline: Timeline?
-    private var bridgeHandle: TaskHandle?
-    private var bridgeBox: AnyObject?
-    private var bridgeItems: [TimelineItem] = []
+    /// How many of the most-recent messages a room keeps resident in RAM.
+    /// Older history is paginated from the SDK on demand as the user scrolls up.
+    private let residentLimit = 100
 
     // Persisted message cache — loaded from disk on open, updated after each diff burst.
     @Published var cachedMessages: [CachedMessage] = []
@@ -101,6 +98,8 @@ final class RoomVM: ObservableObject, Identifiable {
         membership = room.membership()
     }
 
+    /// Tear everything down and release the room's resident message data so a
+    /// closed room stops costing RAM. The disk cache keeps the full history.
     func detach() {
         autoPaginateTask?.cancel()
         autoPaginateTask = nil
@@ -113,33 +112,48 @@ final class RoomVM: ObservableObject, Identifiable {
         typingHandle = nil
         listenerBox = nil
         timeline = nil
-        bridgeHandle = nil
-        bridgeBox = nil
-        bridgeTimeline = nil
-        bridgeItems = []
         pinnedIndexHandle = nil
         pinnedIndexBox = nil
         pinnedIndexTimeline = nil
+        items = []
+        sdkItems = []
+        historicalItems = []
+        cachedMessages = []
+        members = [:]
+        membersLoaded = false
+        typingUserIds = []
+        paginating = false
+        canPaginate = true
+        initialLoadComplete = false
+        hasRefreshBaseline = false
+        lastRefreshSignature = 0
+        historyFullyLoaded = false
     }
 
     /// Force a complete reload of the timeline (useful if history seems out of sync or stuck).
+    /// `detach()` already resets all timeline state, so this is just a teardown + reopen.
     func forceReload() async {
         detach()
-        items.removeAll()
-        historicalItems.removeAll()
-        sdkItems.removeAll()
-        canPaginate = true
-        paginating = false
-        lastRefreshSignature = 0
-        hasRefreshBaseline = false
-        historyFullyLoaded = false
         await openTimeline()
     }
 
     // MARK: - Attach listeners
 
-    /// Open a live timeline + room-info + typing listeners. Idempotent — calling twice is a no-op.
+    /// Subscribe to room metadata (name, avatar, encryption state, pins). Cheap —
+    /// no timeline or event data — so every room can stay current in the sidebar
+    /// without opening a full timeline. Idempotent.
+    func subscribeRoomInfo() {
+        guard roomInfoHandle == nil else { return }
+        let infoListener = RoomInfoBox { [weak self] info in
+            Task { @MainActor in self?.apply(info: info) }
+        }
+        roomInfoHandle = room.subscribeToRoomInfoUpdates(listener: infoListener)
+    }
+
+    /// Open a live timeline + typing listener and load the recent message window.
+    /// Idempotent — calling twice is a no-op.
     func openTimeline() async {
+        subscribeRoomInfo()
         guard timeline == nil else { return }
         initialLoadComplete = false
         print("[Timeline:\(id.prefix(8))] openTimeline room=\(displayName.prefix(20))")
@@ -155,11 +169,6 @@ final class RoomVM: ObservableObject, Identifiable {
         } catch {
             session?.lastError = "Open timeline: \(describe(error))"
         }
-        // Room info updates
-        let infoListener = RoomInfoBox { [weak self] info in
-            Task { @MainActor in self?.apply(info: info) }
-        }
-        self.roomInfoHandle = room.subscribeToRoomInfoUpdates(listener: infoListener)
         // Typing
         let typingListener = TypingBox { [weak self] ids in
             Task { @MainActor in
@@ -173,12 +182,9 @@ final class RoomVM: ObservableObject, Identifiable {
         // Pre-populate the timeline from disk so history is visible before pagination finishes.
         loadCache()
 
-        // Begin loading the full room history in the background.
+        // Load just the recent message window into RAM (~residentLimit messages).
+        // Older history is paginated on demand as the user scrolls up.
         startAutoPaginate()
-
-        // Safety-net poll so reactions/edits show within 3 s even when the
-        // live timeline doesn't push them.
-        startAutoRefresh()
 
         // Open a long-lived pinned-events timeline so we have an authoritative
         // index of pinned event IDs, in addition to whatever RoomInfo reports.
@@ -269,42 +275,24 @@ final class RoomVM: ObservableObject, Identifiable {
         if sorted != pinnedEventIds { pinnedEventIds = sorted }
     }
 
-    /// Walk backwards through the timeline until the SDK reports no more history. Runs
-    /// in the background so the UI stays interactive. Idempotent — already-running task
-    /// is reused.
+    /// Load the most-recent messages into RAM until the resident window is full
+    /// (`residentLimit`) or the start of history is reached. Runs in the background
+    /// so the UI stays interactive. Idempotent — an already-running task is reused.
     func startAutoPaginate() {
-        guard autoPaginateTask == nil else {
-            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, task already running")
-            return
-        }
-        guard timeline != nil else {
-            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, no timeline")
-            return
-        }
-        guard canPaginate else {
-            print("[Pagination:\(id.prefix(8))] startAutoPaginate – skipped, canPaginate=false")
-            return
-        }
-        print("[Pagination:\(id.prefix(8))] startAutoPaginate – starting (items=\(items.count))")
-        let roomId = String(id.prefix(8))
+        guard autoPaginateTask == nil, timeline != nil, canPaginate,
+              items.count < residentLimit else { return }
         autoPaginateTask = Task { [weak self] in
-            var page = 0
             while let self, await !Task.isCancelled {
-                let shouldContinue = await MainActor.run { self.canPaginate && self.timeline != nil }
-                if !shouldContinue { break }
+                let proceed = await MainActor.run {
+                    self.canPaginate && self.timeline != nil && self.items.count < self.residentLimit
+                }
+                if !proceed { break }
                 await MainActor.run { self.paginating = true }
                 let more: Bool
                 do {
-                    guard let t = await self.timelineHandleSafe else {
-                        print("[Pagination:\(roomId)] no timeline handle – stopping")
-                        break
-                    }
+                    guard let t = await self.timelineHandleSafe else { break }
                     more = try await t.paginateBackwards(numEvents: 100)
-                    page += 1
-                    let count = await MainActor.run { self.items.count }
-                    print("[Pagination:\(roomId)] page \(page) – more=\(more) items=\(count)")
                 } catch {
-                    print("[Pagination:\(roomId)] ERROR page \(page): \(error)")
                     await MainActor.run {
                         self.session?.lastError = describe(error)
                         self.paginating = false
@@ -314,14 +302,9 @@ final class RoomVM: ObservableObject, Identifiable {
                 await MainActor.run {
                     self.canPaginate = more
                     self.paginating = false
+                    if !more { self.historyFullyLoaded = true }
                 }
-                if !more {
-                    let count = await MainActor.run { self.items.count }
-                    print("[Pagination:\(roomId)] reached sync wall after \(page) pages, \(count) items — trying context bridge")
-                    await self.runBridgePagination(roomId: roomId)
-                    await MainActor.run { self.historyFullyLoaded = true }
-                    break
-                }
+                if !more { break }
                 // Yield briefly so we don't hog the network or the main thread.
                 try? await Task.sleep(nanoseconds: 5_000_000)
             }
@@ -334,105 +317,6 @@ final class RoomVM: ObservableObject, Identifiable {
 
     /// Background-safe accessor for the timeline handle.
     private var timelineHandleSafe: Timeline? { timeline }
-
-    /// Opens a focused timeline anchored at the oldest known event, which uses the
-    /// server's /context API for its initial token — a different chain than the
-    /// sliding-sync prev_batch. This bridges pagination gaps where the sync wall
-    /// stops before the room's true start.
-    private func runBridgePagination(roomId: String) async {
-        let anchor = await MainActor.run { () -> String? in
-            items.compactMap { item -> String? in
-                guard let ev = item.asEvent() else { return nil }
-                if case .eventId(let eid) = ev.eventOrTransactionId { return eid }
-                return nil
-            }.first
-        }
-        guard let anchor else {
-            print("[Pagination:\(roomId)] bridge – no anchor event, skipping")
-            return
-        }
-        print("[Pagination:\(roomId)] bridge – anchor=\(anchor.prefix(16))")
-        let config = TimelineConfiguration(
-            focus: .event(eventId: anchor, numContextEvents: 20,
-                          threadMode: .automatic(hideThreadedEvents: false)),
-            filter: .all,
-            internalIdPrefix: "bridge-\(id.prefix(8))",
-            dateDividerMode: .daily,
-            trackReadReceipts: .disabled,
-            reportUtds: false
-        )
-        do {
-            let t = try await room.timelineWithConfiguration(configuration: config)
-            await MainActor.run { self.bridgeTimeline = t }
-            let listener = TimelineListenerBox { [weak self] diffs in
-                Task { @MainActor in self?.applyBridgeDiffs(diffs) }
-            }
-            await MainActor.run { self.bridgeBox = listener }
-            let handle = await t.addListener(listener: listener)
-            await MainActor.run { self.bridgeHandle = handle }
-
-            // Let the initial /context items arrive.
-            try? await Task.sleep(nanoseconds: 300_000_000)
-
-            var more = true
-            var page = 0
-            while more && page < 200 && !Task.isCancelled {
-                more = (try? await t.paginateBackwards(numEvents: 100)) ?? false
-                page += 1
-                try? await Task.sleep(nanoseconds: 50_000_000)
-                let count = await MainActor.run { self.bridgeItems.count }
-                print("[Pagination:\(roomId)] bridge page \(page) – more=\(more) bridgeItems=\(count)")
-                if !more { break }
-            }
-
-            // Merge items that aren't already in our timeline.
-            await MainActor.run {
-                for item in self.bridgeItems {
-                    let uid = item.uniqueId().id
-                    guard !self.historicalItems.contains(where: { $0.uniqueId().id == uid }) else { continue }
-                    guard !self.sdkItems.contains(where: { $0.uniqueId().id == uid }) else { continue }
-                    self.historicalItems.append(item)
-                }
-                var merged = self.historicalItems
-                merged.removeAll { h in self.sdkItems.contains { $0.uniqueId().id == h.uniqueId().id } }
-                merged.append(contentsOf: self.sdkItems)
-                self.items = self.dedupedForDisplay(merged)
-            }
-            let final = await MainActor.run { self.items.count }
-            print("[Pagination:\(roomId)] bridge – done, total items now \(final)")
-        } catch {
-            print("[Pagination:\(roomId)] bridge – error: \(error)")
-        }
-        await MainActor.run {
-            self.bridgeHandle = nil
-            self.bridgeBox = nil
-            self.bridgeTimeline = nil
-            self.bridgeItems = []
-        }
-    }
-
-    private func applyBridgeDiffs(_ diffs: [TimelineDiff]) {
-        for diff in diffs {
-            switch diff {
-            case .reset(let v):            bridgeItems = v
-            case .append(let v):           bridgeItems.append(contentsOf: v)
-            case .pushBack(let v):         bridgeItems.append(v)
-            case .pushFront(let v):        bridgeItems.insert(v, at: 0)
-            case .insert(let i, let v):    bridgeItems.insert(v, at: min(Int(i), bridgeItems.count))
-            case .set(let i, let v):
-                let idx = Int(i)
-                if idx < bridgeItems.count { bridgeItems[idx] = v } else { bridgeItems.append(v) }
-            case .remove(let i):
-                let idx = Int(i)
-                if idx < bridgeItems.count { bridgeItems.remove(at: idx) }
-            case .truncate(let l):
-                if bridgeItems.count > Int(l) { bridgeItems.removeLast(bridgeItems.count - Int(l)) }
-            case .clear:   bridgeItems = []
-            case .popFront: if !bridgeItems.isEmpty { bridgeItems.removeFirst() }
-            case .popBack:  if !bridgeItems.isEmpty { bridgeItems.removeLast() }
-            }
-        }
-    }
 
     // MARK: - Periodic safety-net refresh
 
@@ -447,15 +331,22 @@ final class RoomVM: ObservableObject, Identifiable {
         }
     }
 
+    /// Stop the safety-net poll. Called when the room is no longer on screen so
+    /// only the visible room runs the 3 s refresh.
+    func stopAutoRefresh() {
+        autoRefreshTask?.cancel()
+        autoRefreshTask = nil
+    }
+
     /// Build a throwaway live timeline, hash its visible content, and only
     /// re-attach the real listener when the hash changed. No change ⇒ we touch
     /// nothing, so the UI (and scroll position) is left exactly as-is.
     private func refreshTick() async {
-        // Only poll once the initial history sweep is done. Adopting a fresh
-        // timeline mid-sweep would reset pagination progress and thrash the
+        // Only poll once the room has settled on screen. Adopting a fresh
+        // timeline mid-load would reset pagination progress and thrash the
         // load; until then the live listener already surfaces new messages.
-        guard historyFullyLoaded,
-              timeline != nil, bridgeTimeline == nil, !paginating else { return }
+        guard initialLoadComplete,
+              timeline != nil, !paginating else { return }
         let config = TimelineConfiguration(
             focus: .live(hideThreadedEvents: false),
             filter: .all,
@@ -646,29 +537,9 @@ final class RoomVM: ObservableObject, Identifiable {
 
     // MARK: - Timeline actions
 
-    func send(_ text: String) async {
+    func send(_ text: String, mentions: [MentionRef] = []) async {
         guard let timeline else { return }
-        let msg: RoomMessageEventContentWithoutRelation
-        switch SlashCommandParser.parse(text) {
-        case .rainbow(let body):
-            let pair = MessageBuilder.rainbow(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .spoiler(let body):
-            let pair = MessageBuilder.spoiler(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .perLineSpoiler(let body):
-            let pair = MessageBuilder.perLineSpoilers(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .none:
-            // Check for inline ||spoiler|| syntax (Discord-style)
-            if text.contains("||") {
-                let pair = MessageBuilder.inlineSpoilers(text)
-                msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-            } else {
-                // Plain markdown — SDK converts to HTML formatted_body automatically.
-                msg = messageEventContentFromMarkdown(md: text)
-            }
-        }
+        let msg = buildOutgoingMessage(text: text, mentions: mentions)
         do {
             _ = try await timeline.send(msg: msg)
         } catch {
@@ -676,56 +547,47 @@ final class RoomVM: ObservableObject, Identifiable {
         }
     }
 
-    func sendReply(to eventId: String, text: String) async {
+    func sendReply(to eventId: String, text: String, mentions: [MentionRef] = []) async {
         guard let timeline else { return }
-        let msg: RoomMessageEventContentWithoutRelation
-        switch SlashCommandParser.parse(text) {
-        case .rainbow(let body):
-            let pair = MessageBuilder.rainbow(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .spoiler(let body):
-            let pair = MessageBuilder.spoiler(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .perLineSpoiler(let body):
-            let pair = MessageBuilder.perLineSpoilers(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .none:
-            if text.contains("||") {
-                let pair = MessageBuilder.inlineSpoilers(text)
-                msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-            } else {
-                msg = messageEventContentFromMarkdown(md: text)
-            }
-        }
+        let msg = buildOutgoingMessage(text: text, mentions: mentions)
         do {
             try await timeline.sendReply(msg: msg, eventId: eventId)
         } catch { session?.lastError = describe(error) }
     }
 
-    func sendEdit(to eventId: String, text: String) async {
+    func sendEdit(to eventId: String, text: String, mentions: [MentionRef] = []) async {
         guard let timeline else { return }
-        let msg: RoomMessageEventContentWithoutRelation
-        switch SlashCommandParser.parse(text) {
-        case .rainbow(let body):
-            let pair = MessageBuilder.rainbow(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .spoiler(let body):
-            let pair = MessageBuilder.spoiler(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .perLineSpoiler(let body):
-            let pair = MessageBuilder.perLineSpoilers(body)
-            msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-        case .none:
-            if text.contains("||") {
-                let pair = MessageBuilder.inlineSpoilers(text)
-                msg = buildHTMLMessage(plain: pair.plain, html: pair.html)
-            } else {
-                msg = messageEventContentFromMarkdown(md: text)
-            }
-        }
+        let msg = buildOutgoingMessage(text: text, mentions: mentions)
         do {
             try await timeline.edit(eventOrTransactionId: .eventId(eventId: eventId), newContent: .roomMessage(content: msg))
         } catch { session?.lastError = describe(error) }
+    }
+
+    /// Turn composer text into send-ready content: slash commands / spoilers first,
+    /// then mention pills (so a mentioned user is actually notified), else plain
+    /// markdown that the SDK converts to a `formatted_body` for us.
+    private func buildOutgoingMessage(text: String, mentions: [MentionRef]) -> RoomMessageEventContentWithoutRelation {
+        switch SlashCommandParser.parse(text) {
+        case .rainbow(let body):
+            let pair = MessageBuilder.rainbow(body)
+            return buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .spoiler(let body):
+            let pair = MessageBuilder.spoiler(body)
+            return buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .perLineSpoiler(let body):
+            let pair = MessageBuilder.perLineSpoilers(body)
+            return buildHTMLMessage(plain: pair.plain, html: pair.html)
+        case .none:
+            if text.contains("||") {
+                let pair = MessageBuilder.inlineSpoilers(text)
+                return buildHTMLMessage(plain: pair.plain, html: pair.html)
+            }
+            if let mentionMsg = buildMentionMessage(text: text, mentions: mentions) {
+                return mentionMsg
+            }
+            // Plain markdown — SDK converts to HTML formatted_body automatically.
+            return messageEventContentFromMarkdown(md: text)
+        }
     }
 
     private func buildHTMLMessage(plain: String, html: String) -> RoomMessageEventContentWithoutRelation {
@@ -744,6 +606,57 @@ final class RoomVM: ObservableObject, Identifiable {
             ?? messageEventContentFromMarkdown(md: plain)
     }
 
+    /// Build a message that carries real Matrix mentions via `m.mentions.user_ids`
+    /// — which is what actually notifies the mentioned user. The mention is sent as
+    /// plain `@name` text, with no embedded `matrix.to` link. Returns nil when none
+    /// of the tracked mentions still appear in `text` (the caller then falls back to
+    /// the plain markdown path).
+    private func buildMentionMessage(text: String, mentions: [MentionRef]) -> RoomMessageEventContentWithoutRelation? {
+        guard !mentions.isEmpty else { return nil }
+        // Longest names first so a short name can't shadow a longer one that
+        // starts with it (e.g. "@al" vs "@alice").
+        let refs = mentions.filter { !$0.name.isEmpty }
+            .sorted { $0.name.count > $1.name.count }
+
+        var matchedIds: [String] = []
+        var idx = text.startIndex
+        // A mention token only counts at a word boundary (start of text or after
+        // whitespace), mirroring the composer's own @-detection.
+        var atBoundary = true
+        while idx < text.endIndex {
+            var matched = false
+            if atBoundary {
+                for ref in refs {
+                    let token = "@\(ref.name)"
+                    if text[idx...].hasPrefix(token) {
+                        if !matchedIds.contains(ref.userId) { matchedIds.append(ref.userId) }
+                        idx = text.index(idx, offsetBy: token.count)
+                        matched = true
+                        break
+                    }
+                }
+            }
+            if matched {
+                atBoundary = false
+                continue
+            }
+            let ch = text[idx]
+            atBoundary = ch == " " || ch == "\n" || ch == "\t" || ch == "\r"
+            idx = text.index(after: idx)
+        }
+        guard !matchedIds.isEmpty else { return nil }
+
+        // Plain-text body + `m.mentions` only — no formatted HTML, so the mention
+        // notifies the user without rendering as a link on any client.
+        let content = MessageContent(
+            msgType: .text(content: TextMessageContent(body: text, formatted: nil)),
+            body: text,
+            isEdited: false,
+            mentions: Mentions(userIds: matchedIds, room: false)
+        )
+        return try? contentWithoutRelationFromMessage(message: content)
+    }
+
     /// Send one or more files (images, videos, or generic files) from local URLs.
     func sendAttachments(_ urls: [URL]) async {
         for url in urls {
@@ -754,7 +667,11 @@ final class RoomVM: ObservableObject, Identifiable {
     /// Send a single file attachment. Reads the file into memory to avoid
     /// security-scoped resource timing issues, then sends via the SDK.
     func sendAttachment(_ url: URL) async {
-        guard let timeline else { return }
+        NSLog("[upload] sendAttachment: \(url.lastPathComponent) — timeline=\(timeline != nil ? "open" : "NIL")")
+        guard let timeline else {
+            NSLog("[upload] sendAttachment ABORTED: room \(id.prefix(8)) has no open timeline")
+            return
+        }
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
@@ -764,6 +681,7 @@ final class RoomVM: ObservableObject, Identifiable {
         // Read file data into memory so the security-scoped resource doesn't
         // expire before the SDK's background upload finishes.
         guard let fileData = try? Data(contentsOf: url) else {
+            NSLog("[upload] sendAttachment ERROR: cannot read \(url.path) (sandbox? scoped=\(accessing))")
             session?.lastError = "Failed to read file: \(filename)"
             return
         }
@@ -778,8 +696,7 @@ final class RoomVM: ObservableObject, Identifiable {
 
         do {
             if mime.hasPrefix("image/") {
-                let info = imageInfo(for: url, mime: mime)
-                _ = try timeline.sendImage(params: params, thumbnailSource: nil, imageInfo: info)
+                try sendImageData(fileData, filename: filename, mime: mime, timeline: timeline)
             } else if mime.hasPrefix("video/") {
                 let info = VideoInfo(
                     duration: nil, height: nil, width: nil,
@@ -797,14 +714,20 @@ final class RoomVM: ObservableObject, Identifiable {
                 )
                 _ = try timeline.sendFile(params: params, fileInfo: info)
             }
+            NSLog("[upload] sendAttachment OK: \(filename) [\(mime)] \(fileData.count) bytes handed to send queue")
         } catch {
+            NSLog("[upload] sendAttachment ERROR for \(filename): \(describe(error))")
             session?.lastError = describe(error)
         }
     }
 
     /// Send raw data (e.g. from clipboard paste or drag-and-drop).
     func sendData(_ data: Data, filename: String, mime: String) async {
-        guard let timeline else { return }
+        NSLog("[upload] sendData: \(filename) [\(mime)] \(data.count) bytes — timeline=\(timeline != nil ? "open" : "NIL")")
+        guard let timeline else {
+            NSLog("[upload] sendData ABORTED: room \(id.prefix(8)) has no open timeline")
+            return
+        }
         let params = UploadParameters(
             source: .data(bytes: data, filename: filename),
             caption: nil,
@@ -814,16 +737,7 @@ final class RoomVM: ObservableObject, Identifiable {
         )
         do {
             if mime.hasPrefix("image/") {
-                var info = ImageInfo(
-                    height: nil, width: nil, mimetype: mime, size: UInt64(data.count),
-                    thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil, isAnimated: nil
-                )
-                if let source = CGImageSourceCreateWithData(data as CFData, nil),
-                   let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
-                    info.width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.uint64Value
-                    info.height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.uint64Value
-                }
-                _ = try timeline.sendImage(params: params, thumbnailSource: nil, imageInfo: info)
+                try sendImageData(data, filename: filename, mime: mime, timeline: timeline)
             } else if mime.hasPrefix("video/") {
                 let info = VideoInfo(
                     duration: nil, height: nil, width: nil,
@@ -841,7 +755,9 @@ final class RoomVM: ObservableObject, Identifiable {
                 )
                 _ = try timeline.sendFile(params: params, fileInfo: info)
             }
+            NSLog("[upload] sendData OK: \(filename) handed to send queue")
         } catch {
+            NSLog("[upload] sendData ERROR for \(filename): \(describe(error))")
             session?.lastError = describe(error)
         }
     }
@@ -853,22 +769,92 @@ final class RoomVM: ObservableObject, Identifiable {
         return "application/octet-stream"
     }
 
-    private func imageInfo(for url: URL, mime: String) -> ImageInfo {
-        var w: UInt64?
-        var h: UInt64?
-        var size: UInt64?
-        if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
-            w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.uint64Value
-            h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.uint64Value
-        }
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
-            size = (attrs[.size] as? NSNumber)?.uint64Value
-        }
-        return ImageInfo(
-            height: h, width: w, mimetype: mime, size: size,
-            thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil, isAnimated: nil
+    /// Send image bytes. Transcodes to a format the SDK + other clients
+    /// reliably accept (PNG/JPEG/GIF pass through; HEIC/TIFF/BMP/WebP/etc.
+    /// become PNG) and attaches a complete `ImageInfo`. If `sendImage` is still
+    /// rejected, falls back to a plain file send so the upload always lands.
+    private func sendImageData(_ data: Data, filename: String, mime: String, timeline: Timeline) throws {
+        NSLog("[upload] sendImageData: \(filename) [\(mime)] \(data.count) bytes in")
+        let prepared = prepareImageForSending(data)
+        let outData = prepared?.data ?? data
+        let outMime = prepared?.mime ?? mime
+        let outName = prepared.map { swapExtension(filename, to: $0.ext) } ?? filename
+        let params = UploadParameters(
+            source: .data(bytes: outData, filename: outName),
+            caption: nil, formattedCaption: nil, mentions: nil, inReplyTo: nil
         )
+        if let prepared {
+            do {
+                _ = try timeline.sendImage(params: params, thumbnailSource: nil, imageInfo: prepared.info)
+                NSLog("[upload] sendImage OK: \(outName) [\(outMime)] \(outData.count) bytes")
+                return
+            } catch {
+                NSLog("[upload] sendImage REJECTED for \(outName): \(describe(error)) — falling back to a plain file send")
+            }
+        } else {
+            NSLog("[upload] \(filename) did not decode as an image — sending as a plain file")
+        }
+        let fileInfo = FileInfo(
+            mimetype: outMime, size: UInt64(outData.count),
+            thumbnailInfo: nil, thumbnailSource: nil
+        )
+        _ = try timeline.sendFile(params: params, fileInfo: fileInfo)
+        NSLog("[upload] sendFile OK (image path): \(outName) [\(outMime)] \(outData.count) bytes")
+    }
+
+    /// Decode image bytes with ImageIO and return canonical, broadly-supported
+    /// bytes plus a complete `ImageInfo`. PNG/JPEG/GIF are returned unchanged;
+    /// anything else (HEIC, TIFF, BMP, WebP, …) is transcoded to PNG. Returns
+    /// nil when the bytes aren't a decodable image.
+    private func prepareImageForSending(_ data: Data)
+        -> (data: Data, mime: String, ext: String, info: ImageInfo)? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let utiCF = CGImageSourceGetType(src) else {
+            NSLog("[upload] prepareImage: \(data.count) bytes did not decode as an image")
+            return nil
+        }
+        let uti = utiCF as String
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        let width = (props?[kCGImagePropertyPixelWidth] as? NSNumber)?.uint64Value
+        let height = (props?[kCGImagePropertyPixelHeight] as? NSNumber)?.uint64Value
+
+        func info(_ mime: String, _ size: Int, animated: Bool?) -> ImageInfo {
+            ImageInfo(height: height, width: width, mimetype: mime, size: UInt64(size),
+                      thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil, isAnimated: animated)
+        }
+
+        let type = UTType(uti)
+        if type == .png {
+            return (data, "image/png", "png", info("image/png", data.count, animated: nil))
+        }
+        if type == .jpeg {
+            return (data, "image/jpeg", "jpg", info("image/jpeg", data.count, animated: nil))
+        }
+        if type == .gif {
+            return (data, "image/gif", "gif", info("image/gif", data.count, animated: true))
+        }
+
+        // HEIC / TIFF / BMP / WebP / … → transcode to PNG.
+        let out = NSMutableData()
+        guard let cg = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              let dest = CGImageDestinationCreateWithData(out as CFMutableData, UTType.png.identifier as CFString, 1, nil) else {
+            NSLog("[upload] prepareImage: could not set up \(uti) → PNG transcode")
+            return nil
+        }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest), out.length > 0 else {
+            NSLog("[upload] prepareImage: \(uti) → PNG transcode failed")
+            return nil
+        }
+        let png = out as Data
+        NSLog("[upload] prepareImage: transcoded \(uti) → PNG (\(data.count) → \(png.count) bytes)")
+        return (png, "image/png", "png", info("image/png", png.count, animated: nil))
+    }
+
+    /// Replace a filename's extension (e.g. after transcoding an image to PNG).
+    private func swapExtension(_ filename: String, to ext: String) -> String {
+        let base = (filename as NSString).deletingPathExtension
+        return "\(base.isEmpty ? "image" : base).\(ext)"
     }
 
     func toggleReaction(targetEventId: String, key: String) async {
@@ -1047,6 +1033,8 @@ final class RoomVM: ObservableObject, Identifiable {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled, let self else { return }
             let (roomId, snapshot) = await MainActor.run { (self.id, self.buildCacheSnapshot()) }
+            // Never let an empty snapshot (e.g. from a detached room) clobber the disk cache.
+            guard !snapshot.isEmpty else { return }
             CacheStore.save(snapshot, roomId: roomId)
             await MainActor.run { self.cachedMessages = snapshot }
         }

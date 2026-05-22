@@ -23,7 +23,6 @@ final class MatrixSession: ObservableObject {
     private var recoveryStateHandle: TaskHandle?
     private var verificationStateHandle: TaskHandle?
     private var listenerBox: RoomListListener?
-    private var didPreloadTimelines = false
     @Published private(set) var verificationState: VerificationState = .unknown
     @Published private(set) var verification: VerificationController?
 
@@ -197,6 +196,11 @@ final class MatrixSession: ObservableObject {
         self.session = session
         KeychainStore.save(session)
 
+        // Report media-upload progress on local echoes so the timeline can
+        // draw an upload progress bar while an attachment is being sent.
+        client.enableSendQueueUploadProgress(enable: true)
+        NSLog("[upload] media upload-progress reporting enabled — new build is live")
+
         // Sync service
         let syncBuilder = client.syncService()
         let syncService = try await syncBuilder.finish()
@@ -355,6 +359,9 @@ final class MatrixSession: ObservableObject {
             default:
                 newRooms[id] = vm
                 newOrder.append(id)
+                // Keep room metadata (name, avatar, DM/encryption icons) live in
+                // the sidebar without opening a full timeline.
+                vm.subscribeRoomInfo()
             }
         }
         // Detach timelines for rooms that are gone.
@@ -364,15 +371,6 @@ final class MatrixSession: ObservableObject {
         rooms = newRooms
         roomOrder = newOrder
         invites = newInvites
-
-        // Warm every room's timeline once, in the background, so opening any
-        // chat is just rendering (no load wait). openTimeline() is idempotent;
-        // we go sequentially to avoid a thundering herd on launch.
-        if !didPreloadTimelines && !newOrder.isEmpty {
-            didPreloadTimelines = true
-            let vms = newOrder.compactMap { newRooms[$0] }
-            Task { for vm in vms { await vm.openTimeline() } }
-        }
     }
 
     // MARK: - Top-level actions

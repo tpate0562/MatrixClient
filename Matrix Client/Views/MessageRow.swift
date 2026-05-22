@@ -148,6 +148,16 @@ private struct EventRow: View {
         return nil
     }
 
+    /// Upload completion fraction (0...1) for a media local echo that is still
+    /// being sent. nil unless this event is an in-progress media upload —
+    /// requires `Client.enableSendQueueUploadProgress(true)` to populate.
+    private var uploadFraction: Double? {
+        guard let state = event.localSendState,
+              case .notSentYet(let progress) = state,
+              let p = progress, p.progress.total > 0 else { return nil }
+        return min(1, Double(p.progress.current) / Double(p.progress.total))
+    }
+
     var body: some View {
         Group {
             switch event.content {
@@ -395,25 +405,35 @@ private struct EventRow: View {
                     MxcImage(source: img.source, maxWidth: 360, maxHeight: 240)
                 }
                 .buttonStyle(.plain)
+                if let frac = uploadFraction { uploadProgressBar(frac) }
                 if let cap = img.caption, !cap.isEmpty {
                     Text(cap).font(.caption2).foregroundStyle(.tertiary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .video(let v):
-            attachmentChip(systemName: "play.rectangle.fill",
-                           label: v.caption ?? v.filename,
-                           source: v.source, filename: v.filename)
+            VStack(alignment: alignment, spacing: 4) {
+                attachmentChip(systemName: "play.rectangle.fill",
+                               label: v.caption ?? v.filename,
+                               source: v.source, filename: v.filename)
+                if let frac = uploadFraction { uploadProgressBar(frac) }
+            }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .audio(let a):
-            attachmentChip(systemName: "waveform",
-                           label: a.caption ?? a.filename,
-                           source: a.source, filename: a.filename)
+            VStack(alignment: alignment, spacing: 4) {
+                attachmentChip(systemName: "waveform",
+                               label: a.caption ?? a.filename,
+                               source: a.source, filename: a.filename)
+                if let frac = uploadFraction { uploadProgressBar(frac) }
+            }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .file(let f):
-            attachmentChip(systemName: "doc.fill",
-                           label: f.caption ?? f.filename,
-                           source: f.source, filename: f.filename)
+            VStack(alignment: alignment, spacing: 4) {
+                attachmentChip(systemName: "doc.fill",
+                               label: f.caption ?? f.filename,
+                               source: f.source, filename: f.filename)
+                if let frac = uploadFraction { uploadProgressBar(frac) }
+            }
             .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         case .gallery(let g):
             Text("🖼 Gallery (\(g.itemtypes.count) items)").italic().foregroundStyle(.secondary)
@@ -425,6 +445,25 @@ private struct EventRow: View {
             Text(body).textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: bubbleAlignment)
         }
+    }
+
+    /// Determinate upload progress, shown under a media bubble while its local
+    /// echo is still being uploaded to the server.
+    @ViewBuilder
+    private func uploadProgressBar(_ fraction: Double) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.up.circle")
+                .font(.caption2)
+                .foregroundStyle(.tint)
+            ProgressView(value: fraction)
+                .progressViewStyle(.linear)
+                .frame(maxWidth: 220)
+            Text("\(Int((fraction * 100).rounded()))%")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+        .help("Uploading…")
     }
 
     @ViewBuilder
@@ -924,21 +963,34 @@ import LinkPresentation
 struct LinkPreview: NSViewRepresentable {
     let url: URL
 
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> LPLinkView {
         let view = LPLinkView(url: url)
-        LPMetadataProvider().startFetchingMetadata(for: url) { metadata, error in
-            if let metadata = metadata {
-                DispatchQueue.main.async {
-                    view.metadata = metadata
-                    // Re-layout container
-                    view.needsLayout = true
-                }
+        let provider = LPMetadataProvider()
+        context.coordinator.provider = provider
+        provider.startFetchingMetadata(for: url) { [weak view] metadata, _ in
+            guard let metadata, let view else { return }
+            DispatchQueue.main.async {
+                view.metadata = metadata
+                view.needsLayout = true
             }
         }
         return view
     }
 
     func updateNSView(_ nsView: LPLinkView, context: Context) {}
+
+    /// Cancel the in-flight metadata fetch when the row scrolls away, so it
+    /// doesn't run a heavy LPMetadataProvider request to completion or pin the view.
+    static func dismantleNSView(_ nsView: LPLinkView, coordinator: Coordinator) {
+        coordinator.provider?.cancel()
+        coordinator.provider = nil
+    }
+
+    final class Coordinator {
+        var provider: LPMetadataProvider?
+    }
 }
 
 private extension Character {
@@ -971,7 +1023,9 @@ private func isEmojiOnlyMessage(_ body: String) -> Bool {
 extension AttributedString {
     func firstURL() -> URL? {
         for run in self.runs {
-            if let url = run.link, url.scheme != "spoiler" {
+            // Skip spoiler links and `matrix.to` mention pills — neither should
+            // surface a link-preview card.
+            if let url = run.link, url.scheme != "spoiler", url.host != "matrix.to" {
                 return url
             }
         }

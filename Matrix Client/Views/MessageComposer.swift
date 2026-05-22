@@ -36,6 +36,14 @@ final class ComposerController {
 
 enum ACKind { case mention, emoji }
 
+/// A user the composer's @-autocomplete explicitly inserted. Carried up to the
+/// send path so the outgoing message can include a real `matrix.to` pill plus
+/// `m.mentions.user_ids` (without which the mentioned user is never notified).
+struct MentionRef: Equatable {
+    let userId: String
+    let name: String   // exactly the text inserted after the '@'
+}
+
 struct ACEntry: Identifiable {
     let title: String
     let subtitle: String?
@@ -43,6 +51,7 @@ struct ACEntry: Identifiable {
     let avatarMxc: String?
     let glyph: String?          // emoji glyph for emoji rows
     let insert: String
+    let mentionUserId: String?  // resolved Matrix ID for mention rows; nil for emoji
     // Stable across keystrokes (same member/emoji keeps its row → no flicker).
     var id: String { "\(title)\u{1}\(subtitle ?? "")" }
 }
@@ -59,6 +68,7 @@ struct MessageComposer: View {
     @Binding var text: String
     @Binding var replyingToId: String?
     @Binding var editingId: String?
+    @Binding var mentions: [MentionRef]
     @ObservedObject var room: RoomVM
     let onSend: () -> Void
     let onEmoji: () -> Void
@@ -195,48 +205,11 @@ struct MessageComposer: View {
     // MARK: - Drag & drop (covers the non-text areas of the composer)
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        var handled = false
-        for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                // Real files on disk (including image files from Finder).
-                handled = true
-                _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                    if let url, url.isFileURL {
-                        Task { @MainActor in onAttach([url]) }
-                    }
-                }
-            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                // Image dragged from an app/browser (no file URL). Materialize it
-                // to a temp file so it's sent as a real image — images are files too.
-                handled = true
-                provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, _ in
-                    if let url {
-                        let ext = url.pathExtension.isEmpty ? "png" : url.pathExtension
-                        let dst = FileManager.default.temporaryDirectory
-                            .appendingPathComponent(UUID().uuidString)
-                            .appendingPathExtension(ext)
-                        do {
-                            try FileManager.default.copyItem(at: url, to: dst)
-                            Task { @MainActor in onAttach([dst]) }
-                        } catch {
-                            Task { @MainActor in
-                                if let data = try? Data(contentsOf: url) {
-                                    onPasteData(data, "dropped_image.\(ext)",
-                                                UTType(filenameExtension: ext)?.preferredMIMEType ?? "image/png")
-                                }
-                            }
-                        }
-                        return
-                    }
-                    // Last resort: raw bytes off the provider.
-                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
-                        guard let data else { return }
-                        Task { @MainActor in onPasteData(data, "dropped_image.png", "image/png") }
-                    }
-                }
-            }
-        }
-        return handled
+        MediaDrop.handleProviders(
+            providers,
+            onFiles: { urls in onAttach(urls) },
+            onImageData: { data, filename, mime in onPasteData(data, filename, mime) }
+        )
     }
 
     // MARK: - Autocomplete
@@ -335,6 +308,10 @@ struct MessageComposer: View {
         let entry = ac.entries[index]
         controller.replace(NSRange(location: ac.start, length: max(0, ac.end - ac.start)),
                            with: entry.insert)
+        if let uid = entry.mentionUserId {
+            let ref = MentionRef(userId: uid, name: entry.title)
+            if !mentions.contains(ref) { mentions.append(ref) }
+        }
         autocomplete = nil
     }
 
@@ -366,14 +343,16 @@ struct MessageComposer: View {
         return sorted.map { (m, _) in
             ACEntry(title: memberName(m), subtitle: m.userId,
                     avatarName: memberName(m), avatarMxc: m.avatarUrl,
-                    glyph: nil, insert: "@\(memberName(m)) ")
+                    glyph: nil, insert: "@\(memberName(m)) ",
+                    mentionUserId: m.userId)
         }
     }
 
     private func emojiEntries(_ query: String) -> [ACEntry] {
         EmojiData.search(query).map { e in
             ACEntry(title: ":\(e.name):", subtitle: nil, avatarName: nil,
-                    avatarMxc: nil, glyph: e.char, insert: e.char)
+                    avatarMxc: nil, glyph: e.char, insert: e.char,
+                    mentionUserId: nil)
         }
     }
 
@@ -489,7 +468,7 @@ struct MultiLineInput: NSViewRepresentable {
         textView.autocompleteKeyHandler = autocompleteKeyHandler
         textView.fileDropHandler = onFileDrop
         textView.imageDataDropHandler = onPasteData
-        textView.registerForDraggedTypes([.fileURL, .png, .tiff, .fileContents])
+        textView.registerForDraggedTypes([.fileURL, .fileContents] + MediaDrop.imagePasteboardTypes)
         controller.attach(textView)
 
         let scroll = NSScrollView()
@@ -629,7 +608,9 @@ class InputTextView: NSTextView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        canAcceptDrop(sender) ? .copy : super.draggingEntered(sender)
+        let accept = canAcceptDrop(sender)
+        NSLog("[drop] textView draggingEntered — types=\(sender.draggingPasteboard.types?.map(\.rawValue) ?? []) accept=\(accept)")
+        return accept ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -644,14 +625,17 @@ class InputTextView: NSTextView {
         // File URLs (including image files dragged from Finder) → attach as files.
         let urls = droppedFileURLs(sender)
         if !urls.isEmpty {
+            NSLog("[drop] textView performDrop — \(urls.count) file URL(s): \(urls.map(\.lastPathComponent))")
             fileDropHandler?(urls)
             return true
         }
         // Raw image data dragged from an app/browser → send as an image file.
         if let img = droppedImageData(sender) {
+            NSLog("[drop] textView performDrop — image \(img.data.count) bytes [\(img.mime)]")
             imageDataDropHandler?(img.data, img.filename, img.mime)
             return true
         }
+        NSLog("[drop] textView performDrop — nothing usable extracted; deferring to NSTextView default")
         return super.performDragOperation(sender)
     }
 
@@ -662,53 +646,53 @@ class InputTextView: NSTextView {
     }
 
     /// Image bytes when an image is dragged in *without* a backing file URL
-    /// (e.g. dragged out of a browser or Photos). Normalized to PNG.
+    /// (e.g. dragged out of a browser or Photos).
     private func droppedImageData(_ sender: NSDraggingInfo) -> (data: Data, filename: String, mime: String)? {
-        let pb = sender.draggingPasteboard
-        if let png = pb.data(forType: .png) {
-            return (png, "dropped_image.png", "image/png")
-        }
-        if let tiff = pb.data(forType: .tiff),
-           let rep = NSBitmapImageRep(data: tiff),
-           let png = rep.representation(using: .png, properties: [:]) {
-            return (png, "dropped_image.png", "image/png")
-        }
-        if let img = NSImage(pasteboard: pb),
-           let tiff = img.tiffRepresentation,
-           let rep = NSBitmapImageRep(data: tiff),
-           let png = rep.representation(using: .png, properties: [:]) {
-            return (png, "dropped_image.png", "image/png")
-        }
-        return nil
+        MediaDrop.imageFromPasteboard(sender.draggingPasteboard)
     }
 
+    /// Paste handling: a file copied from Finder uploads as an attachment, a
+    /// copied / screenshotted image uploads as an image, otherwise normal text.
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
-        // Check for file URLs on pasteboard (images, documents, etc.)
-        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [
-            .urlReadingFileURLsOnly: true
-        ]) as? [URL], !urls.isEmpty {
+        NSLog("[Composer] paste — pasteboard types: \(pb.types?.map(\.rawValue) ?? [])")
+
+        // 1. File URLs (a file copied in Finder, an attachment from Mail, …).
+        if let urls = pb.readObjects(forClasses: [NSURL.self],
+                                     options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty {
+            NSLog("[Composer] paste — \(urls.count) file URL(s)")
+            var sentAny = false
             for url in urls {
-                if let data = try? Data(contentsOf: url) {
+                // A pasted file URL may carry a security scope; honor it so the
+                // app sandbox lets us read the file's bytes.
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let data = try Data(contentsOf: url)
                     let ext = url.pathExtension.lowercased()
-                    let mime = UTType(filenameExtension: ext)?.preferredMIMEType ?? "application/octet-stream"
+                    let mime = UTType(filenameExtension: ext)?.preferredMIMEType
+                        ?? "application/octet-stream"
+                    NSLog("[Composer] paste — read \(data.count) bytes from \(url.lastPathComponent) [\(mime)] scoped=\(scoped)")
                     pasteDataHandler?(data, url.lastPathComponent, mime)
+                    sentAny = true
+                } catch {
+                    NSLog("[Composer] paste — FAILED to read \(url.path): \(error)")
                 }
             }
+            if sentAny { return }
+            // Couldn't read any of them — fall through to the other paths.
+        }
+
+        // 2. Raw image bytes (a screenshot, an image copied from Preview / a browser).
+        if let img = MediaDrop.imageFromPasteboard(pb) {
+            NSLog("[Composer] paste — image \(img.data.count) bytes [\(img.mime)]")
+            pasteDataHandler?(img.data, img.filename, img.mime)
             return
         }
-        // Check for TIFF (screenshot paste) or PNG data directly
-        if let tiffData = pb.data(forType: .tiff),
-           let bitmapRep = NSBitmapImageRep(data: tiffData),
-           let pngData = bitmapRep.representation(using: .png, properties: [:]) {
-            pasteDataHandler?(pngData, "pasted_image.png", "image/png")
-            return
-        }
-        if let pngData = pb.data(forType: .png) {
-            pasteDataHandler?(pngData, "pasted_image.png", "image/png")
-            return
-        }
-        // Default: paste text
+
+        // 3. Plain text.
+        NSLog("[Composer] paste — no file/image payload, pasting as text")
         super.paste(sender)
     }
 
@@ -729,5 +713,145 @@ class InputTextView: NSTextView {
             )
             NSString(string: placeholder).draw(in: rect, withAttributes: attrs)
         }
+    }
+}
+
+// MARK: - Shared media drop / paste handling
+
+/// Centralised drag-and-drop / paste handling for files and images, shared by
+/// the composer, the room-wide timeline drop target, and the text view.
+/// Every payload reaches the room as either a real file URL (preferred) or raw
+/// bytes (for images dragged in with no backing file).
+enum MediaDrop {
+
+    /// UTTypes a drop target should advertise to accept files and images.
+    static let acceptedTypes: [UTType] = [.fileURL, .image]
+
+    /// Handle a SwiftUI `.onDrop` provider list. `onFiles` receives real file
+    /// URLs; `onImageData` receives raw image bytes for images dragged in
+    /// without a backing file (browser images, Photos, …). Returns true when at
+    /// least one provider is something we can upload.
+    @discardableResult
+    static func handleProviders(_ providers: [NSItemProvider],
+                                onFiles: @escaping ([URL]) -> Void,
+                                onImageData: @escaping (Data, String, String) -> Void) -> Bool {
+        var handled = false
+        for provider in providers {
+            // An image file from Finder conforms to *both* — prefer the file
+            // URL so it uploads with its real name.
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                handled = true
+                loadFileURL(provider, onFiles: onFiles)
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                handled = true
+                loadImage(provider, onFiles: onFiles, onImageData: onImageData)
+            } else {
+                NSLog("[MediaDrop] ignoring provider, types: \(provider.registeredTypeIdentifiers)")
+            }
+        }
+        return handled
+    }
+
+    /// A real file on disk (including an image file dragged from Finder).
+    private static func loadFileURL(_ provider: NSItemProvider,
+                                    onFiles: @escaping ([URL]) -> Void) {
+        _ = provider.loadObject(ofClass: URL.self) { url, error in
+            guard let url, url.isFileURL else {
+                NSLog("[MediaDrop] file URL load failed: \(String(describing: error))")
+                return
+            }
+            NSLog("[MediaDrop] dropped file: \(url.lastPathComponent)")
+            Task { @MainActor in onFiles([url]) }
+        }
+    }
+
+    /// An image with no backing file (dragged from a browser, Photos, …).
+    /// Preferred path: materialise it to a temp file so it uploads as a real
+    /// image; fallback: hand over the raw bytes.
+    private static func loadImage(_ provider: NSItemProvider,
+                                  onFiles: @escaping ([URL]) -> Void,
+                                  onImageData: @escaping (Data, String, String) -> Void) {
+        // Pick the most concrete image UTI the provider offers so the real
+        // format and extension survive (jpeg stays jpeg, gif stays gif).
+        let typeId = provider.registeredTypeIdentifiers.first {
+            UTType($0)?.conforms(to: .image) == true
+        } ?? UTType.image.identifier
+        let ut = UTType(typeId)
+        let ext = ut?.preferredFilenameExtension ?? "png"
+        let mime = ut?.preferredMIMEType ?? "image/png"
+
+        provider.loadFileRepresentation(forTypeIdentifier: typeId) { url, error in
+            if let url {
+                let dstExt = url.pathExtension.isEmpty ? ext : url.pathExtension
+                let dst = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString)
+                    .appendingPathExtension(dstExt)
+                do {
+                    // The provider's temp file is removed once this callback
+                    // returns — copy it out synchronously before that.
+                    try FileManager.default.copyItem(at: url, to: dst)
+                    let bytes = (try? FileManager.default.attributesOfItem(atPath: dst.path))?[.size] as? Int ?? -1
+                    NSLog("[MediaDrop] dropped image materialised: \(dst.lastPathComponent) — \(bytes) bytes, type \(typeId)")
+                    Task { @MainActor in onFiles([dst]) }
+                    return
+                } catch {
+                    NSLog("[MediaDrop] image copy failed: \(error)")
+                }
+            } else {
+                NSLog("[MediaDrop] image file rep failed: \(String(describing: error)) — trying raw bytes")
+            }
+            provider.loadDataRepresentation(forTypeIdentifier: typeId) { data, error2 in
+                guard let data, !data.isEmpty else {
+                    NSLog("[MediaDrop] image data load failed: \(String(describing: error2))")
+                    return
+                }
+                NSLog("[MediaDrop] dropped image bytes: \(data.count) [\(mime)]")
+                Task { @MainActor in onImageData(data, "dropped_image.\(ext)", mime) }
+            }
+        }
+    }
+
+    /// Extract an image off an `NSPasteboard` — used for clipboard paste and
+    /// for AppKit drags whose pasteboard carries image bytes (no file URL).
+    static func imageFromPasteboard(_ pb: NSPasteboard) -> (data: Data, filename: String, mime: String)? {
+        NSLog("[MediaDrop] imageFromPasteboard — types: \(pb.types?.map(\.rawValue) ?? [])")
+        // Keep the original bytes for formats where re-encoding loses something
+        // (GIF animation) or just wastes quality.
+        let passthrough: [(UTType, String, String)] = [
+            (.gif,  "gif",  "image/gif"),
+            (.png,  "png",  "image/png"),
+            (.jpeg, "jpg",  "image/jpeg"),
+            (.heic, "heic", "image/heic"),
+        ]
+        for (type, ext, mime) in passthrough {
+            if let data = pb.data(forType: NSPasteboard.PasteboardType(type.identifier)),
+               !data.isEmpty {
+                NSLog("[MediaDrop] imageFromPasteboard — matched \(type.identifier): \(data.count) bytes")
+                return (data, "pasted_image.\(ext)", mime)
+            }
+        }
+        // TIFF (screenshots land here) → re-encode to PNG; raw TIFF is huge.
+        if let tiff = pb.data(forType: .tiff),
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            NSLog("[MediaDrop] imageFromPasteboard — TIFF→PNG: \(png.count) bytes")
+            return (png, "pasted_image.png", "image/png")
+        }
+        // Last resort: anything NSImage can decode → PNG.
+        if let img = NSImage(pasteboard: pb),
+           let tiff = img.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            NSLog("[MediaDrop] imageFromPasteboard — NSImage→PNG: \(png.count) bytes")
+            return (png, "pasted_image.png", "image/png")
+        }
+        NSLog("[MediaDrop] imageFromPasteboard — no image data found on pasteboard")
+        return nil
+    }
+
+    /// Every image pasteboard type, for `registerForDraggedTypes` so the text
+    /// view accepts image drags in any format (jpeg, gif, heic, webp, …).
+    static var imagePasteboardTypes: [NSPasteboard.PasteboardType] {
+        NSImage.imageTypes.map { NSPasteboard.PasteboardType($0) }
     }
 }

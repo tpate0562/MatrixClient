@@ -25,6 +25,7 @@ struct RoomDetailView: View {
     @EnvironmentObject private var session: MatrixSession
     @EnvironmentObject private var reactionHistory: ReactionHistoryStore
     @State private var draft: String = ""
+    @State private var draftMentions: [MentionRef] = []
     @State private var showAdmin = false
     @State private var showPins = false
     @State private var sourceItem: TimelineItem?
@@ -42,6 +43,8 @@ struct RoomDetailView: View {
     // scrolling to the top sentinel reveals another page.
     @State private var displayLimit: Int = 50
     @State private var loadingMoreWindow = false
+    // True while a file/image drag is hovering anywhere over the room.
+    @State private var isDropTargeted = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -149,7 +152,46 @@ struct RoomDetailView: View {
         }
         .task(id: room.id) {
             await room.openTimeline()
+            // Only the room on screen runs the 3 s safety-net refresh poll.
+            room.startAutoRefresh()
             await room.markAsRead()
+        }
+        .onDisappear { room.stopAutoRefresh() }
+        // Drop files or images anywhere in the room to upload them. The
+        // composer and text view have their own (narrower) drop targets;
+        // this catches everything else — the whole timeline area.
+        .onDrop(of: MediaDrop.acceptedTypes, isTargeted: $isDropTargeted) { providers in
+            NSLog("[RoomDrop] drop with \(providers.count) provider(s)")
+            return MediaDrop.handleProviders(
+                providers,
+                onFiles: { urls in Task { await room.sendAttachments(urls) } },
+                onImageData: { data, name, mime in
+                    Task { await room.sendData(data, filename: name, mime: mime) }
+                }
+            )
+        }
+        .overlay { dropTargetOverlay }
+        .animation(.easeInOut(duration: 0.15), value: isDropTargeted)
+    }
+
+    /// Dashed-border highlight shown while a drag hovers over the room.
+    @ViewBuilder
+    private var dropTargetOverlay: some View {
+        if isDropTargeted {
+            ZStack {
+                Color.accentColor.opacity(0.08)
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor,
+                                  style: StrokeStyle(lineWidth: 2, dash: [8, 5]))
+                    .padding(6)
+                Label("Drop to send", systemImage: "arrow.down.doc.fill")
+                    .font(.title3.weight(.semibold))
+                    .padding(.horizontal, 18).padding(.vertical, 12)
+                    .background(.thickMaterial, in: Capsule())
+                    .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
+            }
+            .allowsHitTesting(false)
+            .transition(.opacity)
         }
     }
 
@@ -427,6 +469,7 @@ struct RoomDetailView: View {
                 text: $draft,
                 replyingToId: $replyingToId,
                 editingId: $editingId,
+                mentions: $draftMentions,
                 room: room,
                 onSend: send,
                 onEmoji: { showEmojiForCompose = true },
@@ -473,10 +516,9 @@ struct RoomDetailView: View {
                 Text("Loading older messages…")
                     .font(.caption).foregroundStyle(.secondary)
             } else if room.canPaginate {
-                // Auto-pagination should normally kick in on its own; expose a button
-                // anyway in case it's been paused.
+                // Loads another page of older history on demand.
                 Button("Load older messages") {
-                    room.startAutoPaginate()
+                    Task { await room.paginate() }
                 }
                 .buttonStyle(.borderless)
                 .font(.caption)
@@ -497,19 +539,21 @@ struct RoomDetailView: View {
         let replyTo = replyingToId
         let editTarget = editingId
         let originalBody = editingOriginalBody
+        let mentions = draftMentions
         replyingToId = nil
         editingId = nil
         editingOriginalBody = ""
+        draftMentions = []
         Task {
             if let editTarget {
                 // Skip the edit if the content didn't actually change.
                 if text != originalBody.trimmingCharacters(in: .whitespacesAndNewlines) {
-                    await room.sendEdit(to: editTarget, text: text)
+                    await room.sendEdit(to: editTarget, text: text, mentions: mentions)
                 }
             } else if let replyTo {
-                await room.sendReply(to: replyTo, text: text)
+                await room.sendReply(to: replyTo, text: text, mentions: mentions)
             } else {
-                await room.send(text)
+                await room.send(text, mentions: mentions)
             }
             await room.markAsRead()
         }
@@ -532,9 +576,13 @@ private struct TypingDots: View {
                     .opacity(phase == i ? 1 : 0.3)
             }
         }
-        .onAppear {
-            Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
-                Task { @MainActor in phase = (phase + 1) % 3 }
+        // `.task` cancels automatically when the view disappears — unlike a
+        // scheduled Timer, which the run loop keeps alive (and firing) forever.
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if Task.isCancelled { break }
+                phase = (phase + 1) % 3
             }
         }
     }
