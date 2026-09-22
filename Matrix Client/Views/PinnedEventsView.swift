@@ -102,7 +102,7 @@ private struct PinnedRow: View {
                 bodyView
             }
             Spacer()
-            if let id = eventId {
+            if let id = eventId, room.canPin {
                 Button { onUnpin(id) } label: {
                     Image(systemName: "pin.slash")
                 }

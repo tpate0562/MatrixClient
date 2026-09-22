@@ -201,14 +201,40 @@ private struct JoinRoomSheet: View {
     let join: () -> Void
     let cancel: () -> Void
 
+    /// Parse matrix.to / element.io / app.element.io links into a room ID or alias.
+    /// Examples:
+    ///   https://matrix.to/#/#room:server         → #room:server
+    ///   https://matrix.to/#/!roomId:server        → !roomId:server
+    ///   https://app.element.io/#/room/#room:server → #room:server
+    private func parseLink(_ input: String) -> String {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let fragment = url.fragment else { return trimmed }
+        // Fragment is like "/#room:server", "/room/#room:server", "/room/!id:server"
+        let parts = fragment.split(separator: "/", omittingEmptySubsequences: true)
+        for part in parts.reversed() {
+            let s = String(part)
+            if s.hasPrefix("#") || s.hasPrefix("!") || s.hasPrefix("@") {
+                // Decode any percent-encoding (matrix.to encodes `:` as `%3A`)
+                return s.removingPercentEncoding ?? s
+            }
+        }
+        return trimmed
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Join Room").font(.title2.bold())
-            Text("Enter a room alias (`#room:server`) or room ID (`!id:server`).")
+            Text("Enter a room alias (`#room:server`), room ID (`!id:server`), or paste a matrix.to / Element link.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            TextField("#room:matrix.org", text: $alias)
+            TextField("#room:matrix.org  or  https://matrix.to/#/#room:server", text: $alias)
                 .textFieldStyle(.roundedBorder)
+                .onChange(of: alias) { _, newValue in
+                    // Auto-resolve matrix.to / element.io links as the user pastes them.
+                    let parsed = parseLink(newValue)
+                    if parsed != newValue { alias = parsed }
+                }
             HStack {
                 Spacer()
                 Button("Cancel", action: cancel)
@@ -218,6 +244,6 @@ private struct JoinRoomSheet: View {
             }
         }
         .padding()
-        .frame(width: 420)
+        .frame(width: 460)
     }
 }

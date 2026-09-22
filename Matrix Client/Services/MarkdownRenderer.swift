@@ -91,11 +91,19 @@ enum MarkdownRenderer {
 
     private static func renderMarkdown(_ body: String) -> AttributedString {
         var normalized = body.replacingOccurrences(of: "\r\n", with: "\n")
+        // Clean up Matrix client mention formats: @<displayname> or @<@user:server> → @name
+        normalized = normalized.replacingMatches(
+            pattern: #"@<(@[^:>]+:[^>]+|[^>]+)>"#
+        ) { inner in
+            // Full MXID like @user:server — keep just the localpart
+            if inner.hasPrefix("@"), let colon = inner.firstIndex(of: ":") {
+                return "@" + String(inner[inner.index(after: inner.startIndex)..<colon])
+            }
+            return "@" + inner
+        }
         // In Markdown, a single newline is a soft break (just a space). For chat
         // messages, users expect newlines to be preserved. Two trailing spaces
         // before a newline forces a hard line break in Markdown.
-        // Only convert SINGLE newlines — double newlines are already paragraph
-        // breaks and must be preserved as-is for blank lines.
         normalized = normalized.replacingOccurrences(
             of: "(?<!\n)\n(?!\n)", with: "  \n",
             options: .regularExpression
@@ -283,13 +291,21 @@ enum MarkdownRenderer {
             }
         }
         // Style any spoiler link runs: hide underline, set fg = bg, opaque dark box.
+        // Also restyle all other links to the app's baby-blue tint — NSAttributedString's
+        // HTML parser bakes in the system link colour as a foregroundColor attribute,
+        // which overrides SwiftUI's .tint() modifier.
+        let linkBlue = NSColor(red: 0.35, green: 0.65, blue: 1.0, alpha: 1.0)
         mutable.enumerateAttribute(.link, in: range) { value, runRange, _ in
-            guard let url = value as? URL, url.scheme == "spoiler" else { return }
-            let box = NSColor(white: 0.27, alpha: 1.0)
-            mutable.addAttribute(.foregroundColor, value: box, range: runRange)
-            mutable.addAttribute(.backgroundColor, value: box, range: runRange)
-            mutable.removeAttribute(.underlineStyle, range: runRange)
-            mutable.addAttribute(.underlineStyle, value: 0, range: runRange)
+            guard let url = value as? URL else { return }
+            if url.scheme == "spoiler" {
+                let box = NSColor(white: 0.27, alpha: 1.0)
+                mutable.addAttribute(.foregroundColor, value: box, range: runRange)
+                mutable.addAttribute(.backgroundColor, value: box, range: runRange)
+                mutable.removeAttribute(.underlineStyle, range: runRange)
+                mutable.addAttribute(.underlineStyle, value: 0, range: runRange)
+            } else {
+                mutable.addAttribute(.foregroundColor, value: linkBlue, range: runRange)
+            }
         }
         // Trim trailing newline the HTML parser tends to append.
         let trimmed = mutable.string.hasSuffix("\n")

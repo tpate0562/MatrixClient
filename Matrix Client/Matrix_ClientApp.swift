@@ -40,8 +40,14 @@ struct Matrix_ClientApp: App {
         }
         .windowResizability(.contentMinSize)
         .commands {
-            // File ▸ Sign Out (replaces the sidebar toolbar button)
+            // File ▸ Repull / Sign Out (replace the sidebar toolbar buttons)
             CommandGroup(after: .newItem) {
+                Divider()
+                Button("Repull All History & Media") {
+                    Task { await session.repullAllHistoryAndMedia() }
+                }
+                .keyboardShortcut("R", modifiers: [.command, .shift])
+                .disabled(!session.isAuthenticated || session.repullInProgress)
                 Divider()
                 Button("Sign Out") {
                     Task { await session.logout() }
@@ -52,8 +58,9 @@ struct Matrix_ClientApp: App {
         }
 
         Settings {
-            MCPSettingsView()
+            AppSettingsView()
                 .environmentObject(mcpServer)
+                .environmentObject(gate)
         }
     }
 }

@@ -38,13 +38,20 @@ struct RoomDetailView: View {
     @State private var showSearch = false
     @State private var searchQuery = ""
     @State private var searchMode: SearchMode = .exact
-    @State private var showImportPicker = false
     // Only the newest `displayLimit` messages are built into the view tree;
     // scrolling to the top sentinel reveals another page.
     @State private var displayLimit: Int = 50
     @State private var loadingMoreWindow = false
     // True while a file/image drag is hovering anywhere over the room.
     @State private var isDropTargeted = false
+    // Timeline container width — drives the 2/3 bubble max-width.
+    @State private var timelineWidth: CGFloat = 600
+    // Event ID to scroll to (set by tapping a reply preview).
+    @State private var scrollToId: String?
+    // Triggered by the composer's /poll slash command.
+    @State private var showCreatePoll = false
+
+    @AppStorage("leftAlignMessages") private var leftAlignMessages = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -92,18 +99,46 @@ struct RoomDetailView: View {
                 .keyboardShortcut("p", modifiers: .command)
                 .help("Pinned messages (⌘P)")
             }
+            // Call button — opens Element Call in the default browser, pre-filled
+            // with this room. The MatrixRustSDK exposes only signaling primitives
+            // (`hasActiveRoomCall`, `activeRoomCallParticipants`, decline events) —
+            // running the actual audio/video stack in-app would mean embedding
+            // Element Call as a widget inside a WKWebView with a full widget-driver
+            // bridge. Browser handoff sidesteps all of that and works today.
             ToolbarItem(placement: .primaryAction) {
                 Menu {
-                    Button("Import from Element…") { showImportPicker = true }
-                    if room.cachedMessages.contains(where: \.isImported) {
-                        Button("Clear Imported History", role: .destructive) { room.clearImport() }
+                    Button { openCall(video: false) } label: {
+                        Label("Voice Call", systemImage: "phone.fill")
+                    }
+                    Button { openCall(video: true) } label: {
+                        Label("Video Call", systemImage: "video.fill")
+                    }
+                    if room.hasActiveCall {
+                        Divider()
+                        Text("\(room.activeCallParticipantCount) participant\(room.activeCallParticipantCount == 1 ? "" : "s") in call")
+                            .foregroundStyle(.secondary)
                     }
                 } label: {
-                    Label("Import", systemImage: room.cachedMessages.contains(where: \.isImported)
-                          ? "square.and.arrow.down.fill"
-                          : "square.and.arrow.down")
+                    Label("Call",
+                          systemImage: room.hasActiveCall ? "phone.connection.fill" : "phone")
+                        .foregroundStyle(room.hasActiveCall ? Color.green : Color.primary)
                 }
-                .help("Import exported chat history")
+                .help(room.hasActiveCall
+                      ? "Join active call (opens in browser)"
+                      : "Start a call (opens in browser)")
+            }
+            // Retry decryption — visible only while undecryptable messages are
+            // in view; clicking re-runs decryption against every megolm session
+            // we've seen fail in this room (useful when room keys arrive late).
+            if !room.utdEventIds.isEmpty {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { room.retryDecryptionNow() } label: {
+                        Label("Retry decryption (\(room.utdEventIds.count))",
+                              systemImage: "lock.rotation")
+                    }
+                    .help("\(room.utdEventIds.count) message(s) can't be decrypted yet — click to retry")
+                    .foregroundStyle(.orange)
+                }
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { showAdmin = true } label: {
@@ -143,12 +178,8 @@ struct RoomDetailView: View {
         .sheet(item: $nicknameTarget) { target in
             NicknameEditor(userId: target.userId, currentName: target.fallbackName)
         }
-        .fileImporter(
-            isPresented: $showImportPicker,
-            allowedContentTypes: [.json],
-            allowsMultipleSelection: true
-        ) { result in
-            if case .success(let urls) = result { room.loadImport(from: urls) }
+        .sheet(isPresented: $showCreatePoll) {
+            CreatePollSheet(room: room)
         }
         .task(id: room.id) {
             await room.openTimeline()
@@ -366,8 +397,6 @@ struct RoomDetailView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     paginationHeader
-                    // Reaching the top of the in-RAM window pulls in the next
-                    // page (older cached rows, then older from the server).
                     Color.clear.frame(height: 1)
                         .onAppear { loadMoreIfNeeded(total: allRows.count) }
                     ForEach(Array(rows.enumerated()), id: \.element.stableId) { idx, displayItem in
@@ -393,7 +422,8 @@ struct RoomDetailView: View {
                                     editingId = id
                                     editingOriginalBody = body
                                     draft = body
-                                }
+                                },
+                                onReplyTap: { eid in scrollToEvent(eid, proxy: proxy) }
                             )
                             .id(displayItem.stableId)
                             .padding(.top, grouped ? 1 : 8)
@@ -408,16 +438,43 @@ struct RoomDetailView: View {
                 }
                 .padding(.horizontal, 12).padding(.vertical, 8)
             }
-            // `defaultScrollAnchor(.bottom)` keeps the view pinned to the
-            // newest message as content size changes — crucially while row
-            // heights settle async (images / markdown / link previews) and as
-            // new messages arrive. The explicit `scrollTo` kick is still
-            // needed because a LazyVStack won't materialize its rows under
-            // `defaultScrollAnchor` alone until something scrolls it.
             .defaultScrollAnchor(.bottom)
+            .background(GeometryReader { g in
+                Color.clear
+                    .onAppear { timelineWidth = g.size.width }
+                    .onChange(of: g.size.width) { _, w in timelineWidth = w }
+            })
             .onAppear { jumpToBottom(proxy) }
             .onChange(of: room.initialLoadComplete) { _, done in
                 if done { jumpToBottom(proxy) }
+            }
+            .onChange(of: scrollToId) { _, eid in
+                guard let eid else { return }
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    proxy.scrollTo(eid, anchor: .center)
+                }
+                scrollToId = nil
+            }
+        }
+        .environment(\.bubbleMaxWidth, timelineWidth * 2 / 3)
+        .environment(\.leftAlignMessages, leftAlignMessages)
+    }
+
+    private func scrollToEvent(_ eventId: String, proxy: ScrollViewProxy) {
+        // Check if the event is already in the displayed rows — if so jump directly.
+        let allRows = displayItems
+        let rows = allRows.count > displayLimit ? Array(allRows.suffix(displayLimit)) : allRows
+        if rows.contains(where: { $0.stableId == eventId }) {
+            withAnimation(.easeInOut(duration: 0.3)) {
+                proxy.scrollTo(eventId, anchor: .center)
+            }
+        } else {
+            // Event is outside the current window — expand display and then scroll.
+            displayLimit = min(displayLimit + 100, allRows.count)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    proxy.scrollTo(eventId, anchor: .center)
+                }
             }
         }
     }
@@ -478,6 +535,12 @@ struct RoomDetailView: View {
                 },
                 onPasteData: { data, filename, mime in
                     Task { await room.sendData(data, filename: filename, mime: mime) }
+                },
+                onSlashAction: { action in
+                    switch action {
+                    case "poll": showCreatePoll = true
+                    default: break
+                    }
                 }
             )
         }
@@ -530,6 +593,30 @@ struct RoomDetailView: View {
             Spacer()
         }
         .padding(.vertical, 6)
+    }
+
+    /// Open Element Call in the default browser, pre-filled with this room.
+    /// `intent` is just metadata sent to the call UI — we use it to hint
+    /// whether the user wanted audio-only.
+    private func openCall(video: Bool) {
+        // Use the canonical alias when we have one so the URL is human-readable;
+        // otherwise fall back to the opaque room ID. `via` lets the join request
+        // route through a server that knows about the room.
+        let target = room.canonicalAlias ?? room.id
+        var components = URLComponents(string: "https://call.element.io/room/")!
+        components.fragment = "/?roomId=\(target)"
+        if let serverName = serverNameFromTarget(target) {
+            components.fragment? += "&via=\(serverName)"
+        }
+        if !video { components.fragment? += "&intent=audio_call" }
+        guard let url = components.url else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func serverNameFromTarget(_ s: String) -> String? {
+        guard let colon = s.firstIndex(of: ":") else { return nil }
+        let server = String(s[s.index(after: colon)...])
+        return server.isEmpty ? nil : server
     }
 
     private func send() {
@@ -611,8 +698,22 @@ enum DisplayItem {
     var stableId: String {
         switch self {
         case .live(let item):
-            if let event = item.asEvent(),
-               case .eventId(let eid) = event.eventOrTransactionId { return eid }
+            if let event = item.asEvent() {
+                if case .eventId(let eid) = event.eventOrTransactionId { return eid }
+                return item.uniqueId().id
+            }
+            // Virtual rows (date dividers, read marker, start-of-room): key off
+            // their *content*, not the SDK uniqueId. The uniqueId embeds the
+            // timeline's internalIdPrefix, so it changes every time autoRefresh
+            // adopts a fresh timeline — which made these rows churn identity and
+            // flicker on each new message. A content key stays stable across adoptions.
+            if let virtual = item.asVirtual() {
+                switch virtual {
+                case .dateDivider(let ts): return "vdiv:\(ts)"
+                case .readMarker:          return "vmarker"
+                case .timelineStart:       return "vstart"
+                }
+            }
             return item.uniqueId().id
         case .cached(let m): return m.id
         }
@@ -651,6 +752,8 @@ private struct CachedMessageRow: View {
     let message: RoomVM.CachedMessage
     let members: [String: RoomMember]
     var isGroupContinuation: Bool = false
+
+    @EnvironmentObject private var session: MatrixSession
 
     private var displayName: String {
         // Prefer the cached display name (from senderProfile at fetch time),
@@ -700,15 +803,34 @@ private struct CachedMessageRow: View {
                         }
                     }
                 }
-                Text(message.body)
-                    .font(.callout)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                messageBody
             }
             Spacer(minLength: 60)
         }
         .padding(.vertical, isGroupContinuation ? 0 : 1)
         .padding(.horizontal, 4)
+    }
+
+    /// A cached image renders the picture (re-fetched from the server) rather
+    /// than falling back to its filename text; everything else is plain text.
+    @ViewBuilder
+    private var messageBody: some View {
+        if let source = message.imageSource {
+            Button {
+                openMediaExternally(source: source,
+                                    filename: message.imageFilename ?? "image",
+                                    client: session.client)
+            } label: {
+                MxcImage(source: source, maxWidth: 360, maxHeight: 240)
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text(message.body)
+                .font(.callout)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }

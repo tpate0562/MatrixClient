@@ -12,6 +12,8 @@ struct RoomAdminView: View {
     @State private var topicDraft: String = ""
     @State private var inviteUser: String = ""
     @State private var actionError: String?
+    @State private var nameSaved = false
+    @State private var topicSaved = false
     @State private var nicknameTarget: NicknameTarget?
 
     private enum Tab: String, CaseIterable, Identifiable {
@@ -74,10 +76,26 @@ struct RoomAdminView: View {
             Field(label: "Name") {
                 HStack {
                     TextField("Room name", text: $nameDraft).textFieldStyle(.roundedBorder)
-                    Button("Save") {
-                        Task { await room.setName(nameDraft) }
+                    if nameSaved {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .transition(.opacity)
                     }
-                    .disabled(nameDraft == room.displayName)
+                    Button("Save") {
+                        nameSaved = false
+                        actionError = nil
+                        Task {
+                            if let err = await room.setName(nameDraft) {
+                                actionError = "Name: \(err)"
+                            } else {
+                                withAnimation { nameSaved = true }
+                                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                withAnimation { nameSaved = false }
+                            }
+                        }
+                    }
+                    .disabled(nameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                              nameDraft == room.displayName)
                 }
             }
             Field(label: "Topic") {
@@ -85,8 +103,23 @@ struct RoomAdminView: View {
                     TextField("Topic", text: $topicDraft, axis: .vertical)
                         .lineLimit(1...4)
                         .textFieldStyle(.roundedBorder)
+                    if topicSaved {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .transition(.opacity)
+                    }
                     Button("Save") {
-                        Task { await room.setTopic(topicDraft) }
+                        topicSaved = false
+                        actionError = nil
+                        Task {
+                            if let err = await room.setTopic(topicDraft) {
+                                actionError = "Topic: \(err)"
+                            } else {
+                                withAnimation { topicSaved = true }
+                                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                withAnimation { topicSaved = false }
+                            }
+                        }
                     }
                     .disabled(topicDraft == (room.topic ?? ""))
                 }

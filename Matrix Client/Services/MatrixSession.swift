@@ -14,6 +14,12 @@ final class MatrixSession: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var recoveryState: RecoveryState = .unknown
 
+    // Full-history repull progress, driven by `repullAllHistoryAndMedia()`.
+    @Published private(set) var repullInProgress = false
+    @Published private(set) var repullDone = 0
+    @Published private(set) var repullTotal = 0
+    @Published private(set) var repullCurrentRoom = ""
+
     private(set) var client: Client?
     private var syncService: SyncService?
     private var roomListService: RoomListService?
@@ -244,6 +250,12 @@ final class MatrixSession: ObservableObject {
 
         await syncService.start()
 
+        // Install the UTD delegate so we log decryption failures with their
+        // probable cause. Per-room retryDecryption is driven by RoomVM, which
+        // owns the timeline handle the SDK requires for the retry call.
+        do { try await client.setUtdDelegate(utdDelegate: UtdDelegateBox()) }
+        catch { NSLog("[utd] setUtdDelegate failed: \(describe(error))") }
+
         // Force the SDK to finish setting up encryption: this triggers device key
         // generation + upload to /keys/upload if it hasn't happened yet. Without this
         // the server returns no device keys for our session, and other clients show us
@@ -419,6 +431,29 @@ final class MatrixSession: ObservableObject {
         } catch { lastError = describe(error) }
     }
 
+    /// Re-pull every joined room's full history from the homeserver and rewrite
+    /// the on-disk cache, so messages cached before media-source persistence (old
+    /// images that now show only their filename) get their `MediaSource` back and
+    /// render again. Rooms are processed one at a time to bound memory; image bytes
+    /// re-download lazily as each picture scrolls into view.
+    func repullAllHistoryAndMedia() async {
+        guard !repullInProgress, client != nil else { return }
+        let ids = roomOrder
+        repullInProgress = true
+        repullTotal = ids.count
+        repullDone = 0
+        defer {
+            repullInProgress = false
+            repullCurrentRoom = ""
+        }
+        for id in ids {
+            guard let vm = rooms[id] else { repullDone += 1; continue }
+            repullCurrentRoom = vm.displayName.isEmpty ? id : vm.displayName
+            await vm.repullFullHistory()
+            repullDone += 1
+        }
+    }
+
     // MARK: - Encryption / recovery
 
     /// Use the user's recovery key (or passphrase derived recovery key) to restore identity
@@ -522,6 +557,43 @@ final class RoomListListener: RoomListEntriesListener, @unchecked Sendable {
     let cb: @Sendable ([RoomListEntriesUpdate]) -> Void
     init(_ cb: @escaping @Sendable ([RoomListEntriesUpdate]) -> Void) { self.cb = cb }
     func onUpdate(roomEntriesUpdate: [RoomListEntriesUpdate]) { cb(roomEntriesUpdate) }
+}
+
+/// Logs UTDs (Unable To Decrypt) reported by the SDK with their probable cause,
+/// so the user has something actionable in Console.app when decryption fails.
+/// The actual retry is driven from `RoomVM.scanForUtds()`, which has the
+/// per-room timeline handle needed to call retryDecryption.
+final class UtdDelegateBox: UnableToDecryptDelegate, @unchecked Sendable {
+    func onUtd(info: UnableToDecryptInfo) {
+        let causeDesc: String
+        switch info.cause {
+        case .unknown:
+            causeDesc = "unknown (probably missing keys not yet in backup)"
+        case .sentBeforeWeJoined:
+            causeDesc = "sent before we joined the room"
+        case .verificationViolation:
+            causeDesc = "sender identity changed (verification violation)"
+        case .unsignedDevice:
+            causeDesc = "sender's device is unsigned"
+        case .unknownDevice:
+            causeDesc = "sender's device is unknown to us"
+        case .historicalMessageAndBackupIsDisabled:
+            causeDesc = "history not available — key backup is disabled"
+        case .withheldForUnverifiedOrInsecureDevice:
+            causeDesc = "sender withheld key from unverified device"
+        case .withheldBySender:
+            causeDesc = "sender deliberately withheld the key"
+        case .historicalMessageAndDeviceIsUnverified:
+            causeDesc = "history not available — this device isn't verified"
+        }
+        let lateInfo: String
+        if let ms = info.timeToDecryptMs {
+            lateInfo = " (decrypted late after \(ms)ms)"
+        } else {
+            lateInfo = ""
+        }
+        NSLog("[utd] \(info.eventId) cause=\(causeDesc) sender=\(info.senderHomeserver) trustsOwn=\(info.userTrustsOwnIdentity)\(lateInfo)")
+    }
 }
 
 // MARK: - Session delegate (token refresh persistence)

@@ -2,6 +2,26 @@ import SwiftUI
 import AppKit
 import MatrixRustSDK
 
+// MARK: - Environment keys
+
+private struct BubbleMaxWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 520
+}
+private struct LeftAlignMessagesKey: EnvironmentKey {
+    static let defaultValue: Bool = false
+}
+
+extension EnvironmentValues {
+    var bubbleMaxWidth: CGFloat {
+        get { self[BubbleMaxWidthKey.self] }
+        set { self[BubbleMaxWidthKey.self] = newValue }
+    }
+    var leftAlignMessages: Bool {
+        get { self[LeftAlignMessagesKey.self] }
+        set { self[LeftAlignMessagesKey.self] = newValue }
+    }
+}
+
 /// One row of the timeline. Dispatches on `TimelineItem.asEvent()` vs `.asVirtual()`.
 struct TimelineRow: View {
     let item: TimelineItem
@@ -16,6 +36,7 @@ struct TimelineRow: View {
     let onShowSource: () -> Void
     let onEditNickname: (String, String) -> Void
     let onEdit: (String, String) -> Void
+    var onReplyTap: ((String) -> Void)? = nil
 
     var body: some View {
         if let virtual = item.asVirtual() {
@@ -32,7 +53,8 @@ struct TimelineRow: View {
                 onTogglePin: onTogglePin,
                 onShowSource: onShowSource,
                 onEditNickname: onEditNickname,
-                onEdit: onEdit
+                onEdit: onEdit,
+                onReplyTap: onReplyTap
             )
         }
     }
@@ -93,11 +115,16 @@ private struct EventRow: View {
     let onShowSource: () -> Void
     let onEditNickname: (String, String) -> Void
     let onEdit: (String, String) -> Void
+    var onReplyTap: ((String) -> Void)? = nil
 
     @EnvironmentObject private var session: MatrixSession
     @EnvironmentObject private var nicknames: NicknameStore
     @EnvironmentObject private var reactionHistory: ReactionHistoryStore
+    @Environment(\.bubbleMaxWidth) private var bubbleMaxWidth
+    @Environment(\.leftAlignMessages) private var leftAlignMessages
     @State private var hovering = false
+    @State private var shiftHeld = false
+    @State private var eventMonitor: Any? = nil
     @State private var revealedSpoilers: Set<Int> = []
 
     private var eventId: String? {
@@ -137,7 +164,19 @@ private struct EventRow: View {
         Date(timeIntervalSince1970: TimeInterval(event.timestamp) / 1000.0)
     }
 
-    private var isOwn: Bool { event.isOwn }
+    private var isOwn: Bool {
+        // Compare directly against the session user ID — more reliable than the SDK flag
+        // for events loaded from history where isOwn can be stale.
+        if let me = session.currentUserId, !me.isEmpty {
+            return event.sender == me
+        }
+        return event.isOwn
+    }
+
+    /// Whether this message is laid out on the right (own message, normal mode).
+    /// In left-align mode everyone — including me — renders on the left, so the
+    /// hover/options pane mirrors to the right just like incoming messages.
+    private var showOnRight: Bool { isOwn && !leftAlignMessages }
 
     private var rawBody: String? {
         if case .msgLike(let content) = event.content,
@@ -183,17 +222,32 @@ private struct EventRow: View {
         }
         // Make the entire row hover-detectable, not just the content area.
         .contentShape(Rectangle())
-        .onHover { hovering = $0 }
+        .onHover { isHovering in
+            hovering = isHovering
+            if isHovering {
+                shiftHeld = NSEvent.modifierFlags.contains(.shift)
+                eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
+                    shiftHeld = event.modifierFlags.contains(.shift)
+                    return event
+                }
+            } else {
+                if let monitor = eventMonitor {
+                    NSEvent.removeMonitor(monitor)
+                    eventMonitor = nil
+                }
+                shiftHeld = false
+            }
+        }
     }
 
     // MARK: - Message-like
 
     @ViewBuilder
     private func messageRow(content: MsgLikeContent) -> some View {
+        // In left-align mode treat all messages as incoming (leading layout).
         HStack(alignment: .top, spacing: 8) {
-            if isOwn {
-                // Right-aligned own message: spacer pushes content to the right.
-                Spacer(minLength: 60)
+            if showOnRight {
+                Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
                     if !isGroupContinuation { senderLine }
                     replyPreview(content.inReplyTo, alignment: .trailing)
@@ -204,6 +258,7 @@ private struct EventRow: View {
                     reactionsRow(content.reactions, alignment: .trailing)
                     readReceiptsRow(alignment: .trailing)
                 }
+                .frame(maxWidth: bubbleMaxWidth, alignment: .trailing)
                 if !isGroupContinuation {
                     Avatar(name: senderName, mxc: senderAvatar, size: 32)
                 } else {
@@ -225,13 +280,14 @@ private struct EventRow: View {
                     reactionsRow(content.reactions, alignment: .leading)
                     readReceiptsRow(alignment: .leading)
                 }
-                Spacer(minLength: 60)
+                .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
+                Spacer()
             }
         }
         .padding(.vertical, isGroupContinuation ? 0 : 1)
         .padding(.horizontal, 4)
         .background(rowBackground)
-        .overlay(alignment: isOwn ? .topLeading : .topTrailing) { hoverActionsOverlay }
+        .overlay(alignment: showOnRight ? .topLeading : .topTrailing) { hoverActionsOverlay }
         .contextMenu {
             if let tx = pendingTransactionId {
                 Button("Discard Unsent Message", role: .destructive) {
@@ -243,7 +299,9 @@ private struct EventRow: View {
                 if event.canBeRepliedTo {
                     Button("Reply") { onReply(eid) }
                 }
-                Button(isPinned ? "Unpin" : "Pin") { onTogglePin(eid) }
+                if room.canPin {
+                    Button(isPinned ? "Unpin" : "Pin") { onTogglePin(eid) }
+                }
                 Divider()
                 Button("View Source", action: onShowSource)
                 Button("Set Nickname for \(serverSenderName)…") {
@@ -283,7 +341,7 @@ private struct EventRow: View {
         if hovering, let eid = eventId {
             hoverActions(eid: eid)
                 .padding(.top, 2)
-                .padding(isOwn ? .leading : .trailing, 8)
+                .padding(showOnRight ? .leading : .trailing, 8)
                 .allowsHitTesting(true)
         }
     }
@@ -304,11 +362,22 @@ private struct EventRow: View {
                 Button { onReply(eid) } label: { Image(systemName: "arrowshape.turn.up.left") }
                     .buttonStyle(.plain).help("Reply")
             }
+            if shiftHeld {
+                Button { onRedact(eid) } label: {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .help("Delete message")
+                .transition(.scale(scale: 0.7).combined(with: .opacity))
+            }
             Menu {
                 if event.canBeRepliedTo {
                     Button("Reply") { onReply(eid) }
                 }
-                Button(isPinned ? "Unpin" : "Pin") { onTogglePin(eid) }
+                if room.canPin {
+                    Button(isPinned ? "Unpin" : "Pin") { onTogglePin(eid) }
+                }
                 Button("View Source", action: onShowSource)
                 Button("Set Nickname for \(serverSenderName)…") {
                     onEditNickname(event.sender, serverSenderName)
@@ -324,6 +393,7 @@ private struct EventRow: View {
             .menuStyle(.borderlessButton)
             .frame(width: 22)
         }
+        .animation(.easeInOut(duration: 0.12), value: shiftHeld)
         .padding(.horizontal, 8).padding(.vertical, 4)
         .background(.thickMaterial)
         .clipShape(Capsule())
@@ -338,8 +408,22 @@ private struct EventRow: View {
             messageContent(msg, alignment: ownAlignment)
         case .sticker(let body, _, _):
             Text("🪧 Sticker: \(body)").italic().foregroundStyle(.secondary)
-        case .poll(let question, _, _, _, _, _, _):
-            Text("📊 Poll: \(question)").italic().foregroundStyle(.secondary)
+        case .poll(let question, let pollKind, let maxSel, let answers, let votes, let endTime, _):
+            if case .eventId(let pollEventId) = event.eventOrTransactionId {
+                PollView(
+                    pollStartEventId: pollEventId,
+                    question: question,
+                    kind: pollKind,
+                    maxSelections: maxSel,
+                    answers: answers,
+                    votes: votes,
+                    endTime: endTime,
+                    room: room
+                )
+            } else {
+                // No event ID yet (still sending) — show a static preview.
+                Text("📊 \(question)").italic().foregroundStyle(.secondary)
+            }
         case .redacted:
             Text("(message deleted)").italic().foregroundStyle(.tertiary)
         case .unableToDecrypt(let msg):
@@ -544,7 +628,7 @@ private struct EventRow: View {
         let textView = Text(attr)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
-            .tint(.blue)
+            .tint(Color(red: 0.35, green: 0.65, blue: 1.0))
         let styled: AnyView = secondary
             ? AnyView(textView.foregroundStyle(.secondary))
             : AnyView(textView)
@@ -583,7 +667,7 @@ private struct EventRow: View {
         let textView = Text(attributed)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
-            .tint(.blue)
+            .tint(Color(red: 0.35, green: 0.65, blue: 1.0))
         let styled: AnyView = secondary
             ? AnyView(textView.foregroundStyle(.secondary))
             : AnyView(textView)
@@ -772,6 +856,7 @@ private struct EventRow: View {
     private func replyPreview(_ details: InReplyToDetails?, alignment: HorizontalAlignment) -> some View {
         if let details {
             let ev = details.event()
+            let replyEventId = replyEventId(ev)
             HStack(spacing: 6) {
                 RoundedRectangle(cornerRadius: 1.5)
                     .fill(Color.accentColor.opacity(0.6))
@@ -791,7 +876,40 @@ private struct EventRow: View {
             .background(Color.secondary.opacity(0.08))
             .clipShape(RoundedRectangle(cornerRadius: 6))
             .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if let eid = replyEventId { onReplyTap?(eid) }
+            }
+            .help("Click to jump to original message")
         }
+    }
+
+    private func replyEventId(_ ev: EmbeddedEventDetails) -> String? {
+        // The SDK doesn't expose the event ID through EmbeddedEventDetails directly,
+        // so we look it up from the inReplyTo object via the event's own ID.
+        // As a fallback, we search room items for a matching sender + content pair.
+        // Walk our own room items to find a message whose body matches the preview.
+        let preview = replyBodyPreview(ev)
+        let senderId = replySenderId(ev)
+        for item in room.items {
+            guard let event = item.asEvent(),
+                  case .eventId(let eid) = event.eventOrTransactionId,
+                  event.sender == senderId,
+                  case .msgLike(let content) = event.content,
+                  case .message(let msg) = content.kind
+            else { continue }
+            let body: String
+            switch msg.msgType {
+            case .text(let t): body = t.body
+            case .notice(let n): body = n.body
+            default: continue
+            }
+            if body == preview { return eid }
+        }
+        if let cached = room.cachedMessages.first(where: { $0.sender == senderId && $0.body == preview }) {
+            return cached.id
+        }
+        return nil
     }
 
     private func replySenderName(_ ev: EmbeddedEventDetails) -> String {
@@ -914,47 +1032,7 @@ private struct EventRow: View {
     // MARK: - Download
 
     private func downloadAndOpen(source: MediaSource, filename: String) {
-        guard let client = session.client else { return }
-        Task {
-            do {
-                let handle = try await client.getMediaFile(
-                    mediaSource: source,
-                    filename: filename,
-                    mimeType: "application/octet-stream",
-                    useCache: true,
-                    tempDir: nil
-                )
-                let sdkPath = try handle.path()
-                let sdkUrl = URL(fileURLWithPath: sdkPath)
-                
-                // The SDK's MediaFile handle deletes the file when deallocated.
-                // Copy it to our own temp directory so it survives long enough
-                // for macOS Preview/QuickLook to open it.
-                let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-                let destUrl = tmp.appendingPathComponent(filename)
-                
-                if FileManager.default.fileExists(atPath: destUrl.path) {
-                    try FileManager.default.removeItem(at: destUrl)
-                }
-                try FileManager.default.copyItem(at: sdkUrl, to: destUrl)
-                
-                await MainActor.run {
-                    NSWorkspace.shared.open(destUrl)
-                }
-            } catch {
-                // Best-effort fallback: write raw bytes to a temp file.
-                if let data = try? await client.getMediaContent(mediaSource: source) {
-                    let tmp = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                    try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-                    let url = tmp.appendingPathComponent(filename)
-                    try? data.write(to: url)
-                    await MainActor.run { NSWorkspace.shared.open(url) }
-                }
-            }
-        }
+        openMediaExternally(source: source, filename: filename, client: session.client)
     }
 }
 

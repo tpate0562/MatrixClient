@@ -45,7 +45,11 @@ final class PinnedEventsVM: ObservableObject {
             let r = rhs.asEvent().map { Int64($0.timestamp) } ?? 0
             return l < r
         }
-        if items.isEmpty { error = "Couldn't load the pinned messages from the server." }
+        // Only flag an error when the server says there ARE pinned events but
+        // every individual fetch timed out — not when the pin list is simply empty.
+        if items.isEmpty {
+            error = "Pinned events exist but couldn't be loaded — they may be too old for the server cache. Try scrolling back to them in the timeline first."
+        }
     }
 
     private func fetchEvent(_ id: String) async -> TimelineItem? {
@@ -62,16 +66,17 @@ final class PinnedEventsVM: ObservableObject {
             return nil
         }
         let acc = DiffAccumulator()
-        let listener = PinnedListenerBox { diffs in
-            Task { @MainActor in acc.apply(diffs) }
-        }
+        // Lock-guarded accumulator — no need to bounce off the SDK's thread.
+        let listener = PinnedListenerBox { diffs in acc.apply(diffs) }
         let handle = await t.addListener(listener: listener)
         timelines.append(t)
         handles.append(handle)
         boxes.append(listener)
 
-        // Wait (up to ~3s) for the focal event to arrive via the listener.
-        for _ in 0..<15 {
+        // Wait (up to ~8s) for the focal event to arrive. Pinned events are
+        // often old messages that aren't in the local cache, so the SDK may
+        // need a server round-trip to fetch them before the listener fires.
+        for _ in 0..<40 {
             if acc.items.contains(where: { Self.matches($0, id) }) { break }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -92,32 +97,43 @@ final class PinnedEventsVM: ObservableObject {
     }
 }
 
-/// Tiny main-actor accumulator that replays timeline diffs into a flat array.
-@MainActor
-final class DiffAccumulator {
-    private(set) var items: [TimelineItem] = []
+/// Tiny lock-guarded accumulator that replays timeline diffs into a flat array.
+/// Deliberately *not* `@MainActor`: the SDK delivers timeline-listener
+/// callbacks on its own thread, and forcing each burst back onto the main
+/// actor just to mutate a local helper used to cost a main-thread hop per
+/// callback (visible as scroll jank during heavy traffic). The lock keeps
+/// reads and writes consistent across whatever threads end up touching it.
+final class DiffAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _items: [TimelineItem] = []
+
+    var items: [TimelineItem] {
+        lock.lock(); defer { lock.unlock() }
+        return _items
+    }
 
     func apply(_ diffs: [TimelineDiff]) {
+        lock.lock(); defer { lock.unlock() }
         for diff in diffs {
             switch diff {
-            case .append(let v):     items.append(contentsOf: v)
-            case .clear:             items.removeAll()
-            case .pushFront(let v):  items.insert(v, at: 0)
-            case .pushBack(let v):   items.append(v)
-            case .popFront:          if !items.isEmpty { items.removeFirst() }
-            case .popBack:           if !items.isEmpty { items.removeLast() }
+            case .append(let v):     _items.append(contentsOf: v)
+            case .clear:             _items.removeAll()
+            case .pushFront(let v):  _items.insert(v, at: 0)
+            case .pushBack(let v):   _items.append(v)
+            case .popFront:          if !_items.isEmpty { _items.removeFirst() }
+            case .popBack:           if !_items.isEmpty { _items.removeLast() }
             case .insert(let i, let v):
-                items.insert(v, at: min(Int(i), items.count))
+                _items.insert(v, at: min(Int(i), _items.count))
             case .set(let i, let v):
                 let idx = Int(i)
-                if idx < items.count { items[idx] = v } else { items.append(v) }
+                if idx < _items.count { _items[idx] = v } else { _items.append(v) }
             case .remove(let i):
                 let idx = Int(i)
-                if idx < items.count { items.remove(at: idx) }
+                if idx < _items.count { _items.remove(at: idx) }
             case .truncate(let len):
-                if items.count > Int(len) { items.removeLast(items.count - Int(len)) }
+                if _items.count > Int(len) { _items.removeLast(_items.count - Int(len)) }
             case .reset(let v):
-                items = v
+                _items = v
             }
         }
     }

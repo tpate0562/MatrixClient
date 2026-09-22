@@ -16,25 +16,30 @@ final class ComposerController {
 
     /// Replace a UTF-16 range in the editor with `replacement`, leaving the caret
     /// just after the inserted text.
-    func replace(_ range: NSRange, with replacement: String) {
+    ///
+    /// Routes through `insertText(_:replacementRange:)` rather than a raw
+    /// `textStorage` edit: the latter inserts the run with no typing attributes,
+    /// so it renders with no colour (dark/invisible), and bypasses the input
+    /// context + undo machinery. `insertText` keeps all of that consistent.
+    ///
+    /// When `expecting` is non-nil the replacement is skipped unless the text
+    /// currently occupying `range` still matches it — callers may defer this a
+    /// runloop tick, by which point the range could be stale.
+    func replace(_ range: NSRange, with replacement: String, expecting: String? = nil) {
         guard let tv = textView else { return }
         let ns = tv.string as NSString
         let loc = min(max(0, range.location), ns.length)
         let len = min(max(0, range.length), ns.length - loc)
         let safe = NSRange(location: loc, length: len)
-        if tv.shouldChangeText(in: safe, replacementString: replacement) {
-            tv.textStorage?.replaceCharacters(in: safe, with: replacement)
-            tv.didChangeText()
-        }
-        let newLoc = safe.location + (replacement as NSString).length
-        tv.setSelectedRange(NSRange(location: newLoc, length: 0))
+        if let expecting, ns.substring(with: safe) != expecting { return }
+        tv.insertText(replacement, replacementRange: safe)
         tv.scrollRangeToVisible(tv.selectedRange())
     }
 }
 
 // MARK: - Autocomplete state
 
-enum ACKind { case mention, emoji }
+enum ACKind { case mention, emoji, slash }
 
 /// A user the composer's @-autocomplete explicitly inserted. Carried up to the
 /// send path so the outgoing message can include a real `matrix.to` pill plus
@@ -52,6 +57,10 @@ struct ACEntry: Identifiable {
     let glyph: String?          // emoji glyph for emoji rows
     let insert: String
     let mentionUserId: String?  // resolved Matrix ID for mention rows; nil for emoji
+    /// Slash command identifier (e.g. "rainbow", "spoiler", "poll"). For commands
+    /// like `/poll` the composer fires an action callback instead of inserting
+    /// `insert` — the host view opens a sheet.
+    let slashAction: String?
     // Stable across keystrokes (same member/emoji keeps its row → no flicker).
     var id: String { "\(title)\u{1}\(subtitle ?? "")" }
 }
@@ -74,11 +83,14 @@ struct MessageComposer: View {
     let onEmoji: () -> Void
     let onAttach: ([URL]) -> Void
     let onPasteData: (Data, String, String) -> Void  // data, filename, mime
+    /// Fired when a slash-command entry that triggers an action (e.g. "poll")
+    /// is selected — the composer doesn't insert anything; the host view opens
+    /// the corresponding sheet.
+    var onSlashAction: ((String) -> Void)? = nil
 
     @FocusState private var focused: Bool
     @State private var lastTypingSent: Date?
     @State private var stopTask: Task<Void, Never>?
-    @State private var showFilePicker = false
     @State private var autocomplete: AutocompleteState?
     @State private var controller = ComposerController()
 
@@ -90,7 +102,10 @@ struct MessageComposer: View {
                         .foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Replying to message").font(.caption.bold())
-                        Text(replyingToId).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                        Text(replyBody(for: replyingToId))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
                     }
                     Spacer()
                     Button { self.replyingToId = nil } label: {
@@ -108,7 +123,10 @@ struct MessageComposer: View {
                         .foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Editing message").font(.caption.bold())
-                        Text(editingId).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                        Text(replyBody(for: editingId))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
                     }
                     Spacer()
                     Button {
@@ -133,8 +151,16 @@ struct MessageComposer: View {
                 .buttonStyle(.plain)
                 .help("Insert emoji")
 
-                // Attachment button
-                Button { showFilePicker = true } label: {
+                // Attachment button — uses NSOpenPanel directly (more reliable on macOS)
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.allowsMultipleSelection = true
+                    panel.canChooseFiles = true
+                    panel.canChooseDirectories = false
+                    if panel.runModal() == .OK {
+                        onAttach(panel.urls)
+                    }
+                } label: {
                     Image(systemName: "paperclip").font(.title3)
                 }
                 .buttonStyle(.plain)
@@ -159,11 +185,32 @@ struct MessageComposer: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay(alignment: .topLeading) {
                     if let ac = autocomplete, !ac.entries.isEmpty {
-                        AutocompletePopup(state: ac) { idx in confirm(idx) }
-                            .frame(width: 340, height: popupHeight(ac))
-                            .offset(y: -(popupHeight(ac) + 6))
-                            .transition(.opacity)
-                            .zIndex(1)
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                LazyVStack(spacing: 0) {
+                                    ForEach(Array(ac.entries.enumerated()), id: \.element.id) { idx, entry in
+                                        autocompleteRow(entry, selected: idx == ac.selected)
+                                            .id(entry.id)
+                                            .contentShape(Rectangle())
+                                            .onTapGesture { confirm(idx) }
+                                    }
+                                }
+                            }
+                            .onChange(of: ac.selected) { _, sel in
+                                guard ac.entries.indices.contains(sel) else { return }
+                                withAnimation(.linear(duration: 0.08)) {
+                                    proxy.scrollTo(ac.entries[sel].id)
+                                }
+                            }
+                        }
+                        .background(.thickMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.25), lineWidth: 0.5))
+                        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+                        .frame(width: 340, height: popupHeight(ac))
+                        .offset(y: -(popupHeight(ac) + 6))
+                        .transition(.opacity)
+                        .zIndex(1)
                     }
                 }
 
@@ -183,23 +230,63 @@ struct MessageComposer: View {
             stopTask?.cancel()
             Task { await room.setTyping(false) }
         }
-        .fileImporter(
-            isPresented: $showFilePicker,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: true
-        ) { result in
-            if case .success(let urls) = result {
-                onAttach(urls)
-            }
-        }
         .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
             handleDrop(providers)
         }
     }
 
+    // MARK: - Reply / edit body lookup
+
+    /// Look up the plain-text body for a given event ID so the reply/edit banner
+    /// shows the message content rather than the raw event ID.
+    private func replyBody(for eventId: String) -> String {
+        for item in room.items {
+            guard let event = item.asEvent(),
+                  case .eventId(let eid) = event.eventOrTransactionId,
+                  eid == eventId,
+                  case .msgLike(let content) = event.content,
+                  case .message(let msg) = content.kind
+            else { continue }
+            switch msg.msgType {
+            case .text(let t):   return t.body
+            case .notice(let n): return n.body
+            case .image:         return "🖼 Image"
+            case .video:         return "🎥 Video"
+            case .audio:         return "🎵 Audio"
+            case .file:          return "📄 File"
+            default:             return msg.body
+            }
+        }
+        if let cached = room.cachedMessages.first(where: { $0.id == eventId }) {
+            return cached.body
+        }
+        return eventId   // last resort: show the raw ID
+    }
+
     private func popupHeight(_ ac: AutocompleteState) -> CGFloat {
         let visible = min(ac.entries.count, 6)
         return CGFloat(visible) * 34 + 10
+    }
+
+    @ViewBuilder
+    private func autocompleteRow(_ entry: ACEntry, selected: Bool) -> some View {
+        HStack(spacing: 8) {
+            if let glyph = entry.glyph {
+                Text(glyph).font(.system(size: 20)).frame(width: 26)
+            } else {
+                Avatar(name: entry.avatarName ?? entry.title, mxc: entry.avatarMxc, size: 24)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                Text(entry.title).font(.callout).lineLimit(1)
+                if let sub = entry.subtitle {
+                    Text(sub).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .background(selected ? Color.accentColor.opacity(0.2) : Color.clear)
     }
 
     // MARK: - Drag & drop (covers the non-text areas of the composer)
@@ -218,10 +305,13 @@ struct MessageComposer: View {
         case mention(query: String, start: Int, end: Int)
         case emoji(query: String, start: Int, end: Int)
         case emojiComplete(name: String, start: Int, end: Int)
+        case slash(query: String, start: Int, end: Int)
     }
 
     /// Inspect the whitespace-delimited token ending at the caret and decide whether
-    /// it triggers a `@mention` list, a `:emoji:` search, or a completed `:name:`.
+    /// it triggers a `@mention` list, a `:emoji:` search, a completed `:name:`, or
+    /// a `/command` menu. Slash commands are only offered when the `/` is the first
+    /// character of the message (so "https://…" isn't mis-detected).
     private func detect(text: String, caretUTF16: Int) -> Detection? {
         let total = text.utf16.count
         let caretOff = max(0, min(caretUTF16, total))
@@ -239,6 +329,18 @@ struct MessageComposer: View {
         let token = String(text[startIdx..<caretIdx])
         guard let first = token.first else { return nil }
         let startOff = startIdx.utf16Offset(in: text)
+
+        // Slash commands: only at the very start of the message, and only when
+        // the token contains no spaces (so the menu disappears as soon as the
+        // user starts typing the command's argument).
+        if first == "/" && startIdx == text.startIndex {
+            let q = String(token.dropFirst())
+            // Only letters/dashes after the slash → still in the command name.
+            if q.allSatisfy({ $0.isLetter || $0 == "-" }) {
+                return .slash(query: q, start: startOff, end: caretOff)
+            }
+            return nil
+        }
 
         if first == "@" {
             return .mention(query: String(token.dropFirst()), start: startOff, end: caretOff)
@@ -275,9 +377,24 @@ struct MessageComposer: View {
             let entries = emojiEntries(q)
             autocomplete = entries.isEmpty ? nil
                 : AutocompleteState(kind: .emoji, entries: entries, selected: 0, start: s, end: e)
+        case .slash(let q, let s, let e):
+            let entries = slashEntries(q)
+            autocomplete = entries.isEmpty ? nil
+                : AutocompleteState(kind: .slash, entries: entries, selected: 0, start: s, end: e)
         case .emojiComplete(let name, let s, let e):
             if let ch = EmojiData.exact(name) {
-                controller.replace(NSRange(location: s, length: max(0, e - s)), with: ch)
+                // This runs inside the text view's own textDidChange (via
+                // onCaret). Mutating the text view synchronously from there
+                // re-enters its editing machinery and wedges the editor —
+                // typing and sending stop working. Deferring a runloop tick
+                // lets the current edit cycle finish first.
+                let token = ":\(name):"
+                let controller = controller
+                DispatchQueue.main.async {
+                    controller.replace(NSRange(location: s, length: max(0, e - s)),
+                                        with: ch, expecting: token)
+                }
+                EmojiUsageStore.shared.record(name)
             }
             autocomplete = nil
         }
@@ -306,11 +423,26 @@ struct MessageComposer: View {
     private func confirm(_ index: Int) {
         guard let ac = autocomplete, ac.entries.indices.contains(index) else { return }
         let entry = ac.entries[index]
+        // Slash actions (e.g. /poll) clear the composer text and fire a host
+        // callback rather than inserting anything — the host opens a sheet.
+        if let action = entry.slashAction {
+            controller.replace(NSRange(location: ac.start, length: max(0, ac.end - ac.start)),
+                               with: "")
+            autocomplete = nil
+            onSlashAction?(action)
+            return
+        }
         controller.replace(NSRange(location: ac.start, length: max(0, ac.end - ac.start)),
                            with: entry.insert)
         if let uid = entry.mentionUserId {
             let ref = MentionRef(userId: uid, name: entry.title)
             if !mentions.contains(ref) { mentions.append(ref) }
+        }
+        // Track emoji usage so the next search boosts this emoji.
+        // entry.title is ":<name>:" for emoji rows; mentionUserId == nil distinguishes them.
+        if ac.kind == .emoji {
+            let name = String(entry.title.dropFirst().dropLast())
+            EmojiUsageStore.shared.record(name)
         }
         autocomplete = nil
     }
@@ -344,16 +476,64 @@ struct MessageComposer: View {
             ACEntry(title: memberName(m), subtitle: m.userId,
                     avatarName: memberName(m), avatarMxc: m.avatarUrl,
                     glyph: nil, insert: "@\(memberName(m)) ",
-                    mentionUserId: m.userId)
+                    mentionUserId: m.userId, slashAction: nil)
         }
     }
 
     private func emojiEntries(_ query: String) -> [ACEntry] {
-        EmojiData.search(query).map { e in
+        let results = EmojiData.search(query)
+        let store = EmojiUsageStore.shared
+        // Promote previously-used emojis to the top; within equal usage counts
+        // preserve the relevance order that EmojiData.search already computed.
+        let ranked = results
+            .enumerated()
+            .sorted { a, b in
+                let ca = store.count(for: a.element.name)
+                let cb = store.count(for: b.element.name)
+                if ca != cb { return ca > cb }
+                return a.offset < b.offset
+            }
+            .map(\.element)
+        return ranked.map { e in
             ACEntry(title: ":\(e.name):", subtitle: nil, avatarName: nil,
                     avatarMxc: nil, glyph: e.char, insert: e.char,
-                    mentionUserId: nil)
+                    mentionUserId: nil, slashAction: nil)
         }
+    }
+
+    /// Available slash commands shown in the `/` menu. Inserts text for the
+    /// formatting commands; `/poll` carries a `slashAction` so the host view
+    /// opens the poll-creation sheet instead.
+    private struct SlashCommand {
+        let name: String          // canonical command name, e.g. "rainbow"
+        let glyph: String         // SF Symbol-ish character or emoji shown in the row
+        let description: String
+        let insert: String        // text inserted when chosen (empty → action)
+        let action: String?       // non-nil → fires onSlashAction instead of inserting
+    }
+
+    private static let slashCommands: [SlashCommand] = [
+        SlashCommand(name: "rainbow", glyph: "🌈",
+                     description: "Rainbow-colour your message",
+                     insert: "/rainbow ", action: nil),
+        SlashCommand(name: "spoiler", glyph: "🙈",
+                     description: "Hide text behind a spoiler",
+                     insert: "/spoiler ", action: nil),
+        SlashCommand(name: "poll",    glyph: "📊",
+                     description: "Create a poll",
+                     insert: "", action: "poll"),
+    ]
+
+    private func slashEntries(_ query: String) -> [ACEntry] {
+        let q = query.lowercased()
+        return Self.slashCommands
+            .filter { q.isEmpty || $0.name.hasPrefix(q) }
+            .map { cmd in
+                ACEntry(title: "/\(cmd.name)", subtitle: cmd.description,
+                        avatarName: nil, avatarMxc: nil,
+                        glyph: cmd.glyph, insert: cmd.insert,
+                        mentionUserId: nil, slashAction: cmd.action)
+            }
     }
 
     // MARK: - Typing notice
@@ -378,56 +558,6 @@ struct MessageComposer: View {
                 await MainActor.run { lastTypingSent = nil }
             }
         }
-    }
-}
-
-// MARK: - Autocomplete popup
-
-private struct AutocompletePopup: View {
-    let state: AutocompleteState
-    let onPick: (Int) -> Void
-
-    var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(state.entries.enumerated()), id: \.element.id) { idx, entry in
-                        row(entry, selected: idx == state.selected)
-                            .id(idx)
-                            .contentShape(Rectangle())
-                            .onTapGesture { onPick(idx) }
-                    }
-                }
-            }
-            .onChange(of: state.selected) { _, sel in
-                withAnimation(.linear(duration: 0.08)) { proxy.scrollTo(sel, anchor: .center) }
-            }
-        }
-        .background(.thickMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.25), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
-    }
-
-    @ViewBuilder
-    private func row(_ entry: ACEntry, selected: Bool) -> some View {
-        HStack(spacing: 8) {
-            if let glyph = entry.glyph {
-                Text(glyph).font(.system(size: 20)).frame(width: 26)
-            } else {
-                Avatar(name: entry.avatarName ?? entry.title, mxc: entry.avatarMxc, size: 24)
-            }
-            VStack(alignment: .leading, spacing: 0) {
-                Text(entry.title).font(.callout).lineLimit(1)
-                if let sub = entry.subtitle {
-                    Text(sub).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .frame(height: 34)
-        .background(selected ? Color.accentColor.opacity(0.2) : Color.clear)
     }
 }
 
@@ -649,6 +779,17 @@ class InputTextView: NSTextView {
     /// (e.g. dragged out of a browser or Photos).
     private func droppedImageData(_ sender: NSDraggingInfo) -> (data: Data, filename: String, mime: String)? {
         MediaDrop.imageFromPasteboard(sender.draggingPasteboard)
+    }
+
+    /// Keep the Paste command (⌘V) enabled even when the clipboard holds only
+    /// an image. A plain-text NSTextView's own validation reports it can't
+    /// paste image-only content (no string on the pasteboard), which disables
+    /// Edit ▸ Paste — so ⌘V is silently swallowed and `paste(_:)` never runs
+    /// for a screenshot. We handle image and file paste ourselves, so force
+    /// the command on.
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(paste(_:)) { return true }
+        return super.validateUserInterfaceItem(item)
     }
 
     /// Paste handling: a file copied from Finder uploads as an attachment, a

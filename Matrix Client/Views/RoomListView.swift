@@ -5,6 +5,7 @@ struct RoomListView: View {
     @EnvironmentObject private var session: MatrixSession
     @Binding var selectedRoomId: String?
     @State private var filter: String = ""
+    @State private var spacesExpanded: Bool = false
 
     private enum Section: String, CaseIterable, Identifiable {
         case all = "All", dms = "Direct", rooms = "Rooms"
@@ -23,6 +24,10 @@ struct RoomListView: View {
 
             if !session.invites.isEmpty {
                 invitesSection
+            }
+
+            if !joinedSpaces().isEmpty {
+                spacesSection
             }
 
             List(selection: $selectedRoomId) {
@@ -72,10 +77,70 @@ struct RoomListView: View {
         .padding(.vertical, 6)
     }
 
+    /// Collapsible "Spaces" section. Spaces are tagged `m.space` rooms — they
+    /// belong in their own list rather than mixed in with chat rooms. Tapping
+    /// one selects it; the detail pane shows its (typically empty) timeline,
+    /// which is enough to leave a space or see who's in it. Full child-room
+    /// browsing would need the `/_matrix/client/v1/rooms/{roomId}/hierarchy`
+    /// endpoint, which this SDK build doesn't expose directly.
+    private var spacesSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { spacesExpanded.toggle() }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: spacesExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                    Text("Spaces (\(joinedSpaces().count))")
+                        .font(.caption.bold())
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+
+            if spacesExpanded {
+                ForEach(joinedSpaces(), id: \.id) { vm in
+                    HStack(spacing: 8) {
+                        Avatar(name: vm.displayName, mxc: vm.avatarUrl, size: 22)
+                        Text(vm.displayName).font(.callout).lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 3)
+                    .background(
+                        selectedRoomId == vm.id
+                            ? Color.accentColor.opacity(0.15)
+                            : Color.clear
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture { selectedRoomId = vm.id }
+                    .contextMenu {
+                        Button("Leave Space", role: .destructive) {
+                            Task { await vm.leave() }
+                        }
+                    }
+                }
+            }
+            Divider().padding(.top, 4)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func joinedSpaces() -> [RoomVM] {
+        session.roomOrder.compactMap { session.rooms[$0] }
+            .filter { $0.isSpace }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
     private func filtered() -> [RoomVM] {
         let base = session.roomOrder.compactMap { session.rooms[$0] }
         let f = filter.lowercased()
         return base.filter { vm in
+            // Always hide spaces from the main chat list — they have their own section.
+            if vm.isSpace { return false }
             switch section {
             case .all: break
             case .dms: if !vm.isDirect { return false }
@@ -93,8 +158,18 @@ private struct RoomRow: View {
     @ObservedObject var vm: RoomVM
 
     var body: some View {
-        HStack(spacing: 10) {
-            Avatar(name: vm.displayName, mxc: vm.avatarUrl, size: 32)
+        // For DMs, show the other person's profile picture in place of the
+        // room avatar (which is usually nil for 1:1 rooms anyway). Falls back
+        // to the room avatar when the partner hasn't uploaded a picture, and
+        // uses the partner's name for the colored-initials placeholder so the
+        // fallback circle picks up the right initials + accent color.
+        let isDM = vm.isDirect && vm.dmPartnerUserId != nil
+        let avatarMxc = isDM ? (vm.dmPartnerAvatarUrl ?? vm.avatarUrl) : vm.avatarUrl
+        let avatarName = isDM
+            ? (vm.dmPartnerDisplayName ?? vm.dmPartnerUserId ?? vm.displayName)
+            : vm.displayName
+        return HStack(spacing: 10) {
+            Avatar(name: avatarName, mxc: avatarMxc, size: 32)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     if vm.isDirect {
