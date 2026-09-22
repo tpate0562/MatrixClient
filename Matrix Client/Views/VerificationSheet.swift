@@ -38,6 +38,8 @@ struct VerificationSheet: View {
             waitingView(label: "Waiting for the other device…")
         case .emojis(let items):
             emojisView(items: items)
+        case .approved:
+            waitingView(label: "Waiting for the other device to confirm…")
         case .finished:
             terminal(systemImage: "checkmark.seal.fill", color: .green, title: "Verified", subtitle: "This device is now cross-signed and trusted.")
         case .cancelled(let reason):
@@ -83,7 +85,7 @@ struct VerificationSheet: View {
                     Task { await controller.requestVerification() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(session.recoveryState != .enabled)
+                .disabled(session.recoveryState != .enabled || controller.isBusy)
             }
         }
     }
@@ -110,6 +112,7 @@ struct VerificationSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .disabled(controller.isBusy)
             }
         }
     }
@@ -148,12 +151,14 @@ struct VerificationSheet: View {
                 Button("They don't match", role: .destructive) {
                     Task { await controller.declineMatch() }
                 }
+                .disabled(controller.isBusy)
                 Spacer()
                 Button("They match") {
                     Task { await controller.confirmMatch() }
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .disabled(controller.isBusy)
             }
         }
     }
